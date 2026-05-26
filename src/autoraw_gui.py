@@ -11,6 +11,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+try:
+    import windnd  # type: ignore[import-not-found]
+except Exception:
+    windnd = None
+
 from PIL import Image, ImageEnhance, ImageOps, ImageTk
 
 from app_paths import resource_path
@@ -19,10 +24,7 @@ from autoraw_crop import (
     CANVAS_SIZE,
     LAYOUT_RULES,
     Box,
-    crop_from_object,
-    crop_from_rule,
-    detect_object,
-    expand_box,
+    compute_auto_crop_box,
     frame_id,
     image_files,
     open_preview,
@@ -141,35 +143,6 @@ def fit_image(img: Image.Image, size: tuple[int, int]) -> Image.Image:
     return canvas
 
 
-def auto_crop(path: Path, img: Image.Image, aspect: float) -> Box:
-    frame = frame_id(path)
-    rule = LAYOUT_RULES.get(frame)
-    analysis = img.copy()
-    analysis.thumbnail((360, 360), Image.Resampling.LANCZOS)
-    detected_box, _ = detect_object(analysis, combine_components=bool(rule and rule.combine_components))
-    object_box = scale_box(detected_box, analysis.size, img.size) if detected_box else None
-
-    if object_box and rule and not rule.manual_only:
-        layout_box = expand_box(object_box, img.size, rule)
-        return crop_from_rule(layout_box, img.size, aspect, rule)
-
-    if object_box:
-        return crop_from_object(object_box, img.size, aspect, padding=0.11)
-
-    return Box(0, 0, img.width, img.height)
-
-
-def scale_box(box: Box, source_size: tuple[int, int], target_size: tuple[int, int]) -> Box:
-    sx = target_size[0] / source_size[0]
-    sy = target_size[1] / source_size[1]
-    return Box(
-        int(box.left * sx),
-        int(box.top * sy),
-        int(box.right * sx),
-        int(box.bottom * sy),
-    ).clamp(*target_size)
-
-
 def render_frame(
     state: FrameState,
     size: tuple[int, int] = CANVAS_SIZE,
@@ -195,27 +168,10 @@ def render_frame(
     sin_t = abs(math.sin(theta))
     cos_t = abs(math.cos(theta))
 
-    # For rotation we keep at least 1.0 base zoom, then auto-zoom in so
-    # corners stay inside the source image (no black/white fillers).
+    # Не усиливаем зум при повороте: пользовательский масштаб должен
+    # оставаться тем, который выставлен на слайдере.
     if rotation:
         zoom = max(1.0, zoom)
-        rot_factor_x = (cos_t * float(size[0]) + sin_t * float(size[1])) / max(1.0, float(size[0]))
-        rot_factor_y = (sin_t * float(size[0]) + cos_t * float(size[1])) / max(1.0, float(size[1]))
-        zoom *= max(rot_factor_x, rot_factor_y)
-
-    # If source is still too small for rotated viewport, zoom in further.
-    while True:
-        viewport_w = max(1.0, box.width / zoom)
-        viewport_h = max(1.0, box.height / zoom)
-        rot_bbox_w = cos_t * viewport_w + sin_t * viewport_h
-        rot_bbox_h = sin_t * viewport_w + cos_t * viewport_h
-        need = max(
-            rot_bbox_w / max(1.0, float(source.width)),
-            rot_bbox_h / max(1.0, float(source.height)),
-        )
-        if need <= 1.0 + 1e-6:
-            break
-        zoom *= need
 
     viewport_w = max(1.0, box.width / zoom)
     viewport_h = max(1.0, box.height / zoom)
@@ -224,9 +180,19 @@ def render_frame(
 
     base_cx = (box.left + box.right) / 2.0
     base_cy = (box.top + box.bottom) / 2.0
-    cx = base_cx - (state.offset_x * scale_src_x)
-    cy = base_cy - (state.offset_y * scale_src_y)
+    # Смещения заданы в пикселях холста CANVAS_SIZE (как слайдеры и перетаскивание).
+    canvas_w, canvas_h = float(CANVAS_SIZE[0]), float(CANVAS_SIZE[1])
+    dx_screen = state.offset_x * viewport_w / canvas_w
+    dy_screen = state.offset_y * viewport_h / canvas_h
+    # Offsets are controlled in screen/canvas axes.
+    # Convert them into source axes so panning stays intuitive after rotation.
+    dx_src = cos_t * dx_screen + sin_t * dy_screen
+    dy_src = -sin_t * dx_screen + cos_t * dy_screen
+    cx = base_cx - dx_src
+    cy = base_cy - dy_src
 
+    # Для поворота берём из источника увеличенную область (bounding box),
+    # чтобы после rotate() центр кадра остался заполненным пикселями фото.
     rot_bbox_w = cos_t * viewport_w + sin_t * viewport_h
     rot_bbox_h = sin_t * viewport_w + cos_t * viewport_h
     min_cx = rot_bbox_w / 2.0
@@ -242,18 +208,30 @@ def render_frame(
     else:
         cy = max(min_cy, min(max_cy, cy))
 
-    viewport_left = cx - viewport_w / 2.0
-    viewport_top = cy - viewport_h / 2.0
+    if rotation:
+        rot_factor_x = (cos_t * float(size[0]) + sin_t * float(size[1])) / max(1.0, float(size[0]))
+        rot_factor_y = (sin_t * float(size[0]) + cos_t * float(size[1])) / max(1.0, float(size[1]))
+        sample_size = (
+            max(size[0], int(math.ceil(size[0] * rot_factor_x))),
+            max(size[1], int(math.ceil(size[1] * rot_factor_y))),
+        )
+    else:
+        sample_size = size
 
+    sample_left = cx - (sample_size[0] * scale_src_x) / 2.0
+    sample_top = cy - (sample_size[1] * scale_src_y) / 2.0
     frame = source.transform(
-        size,
+        sample_size,
         Image.Transform.AFFINE,
-        (scale_src_x, 0.0, viewport_left, 0.0, scale_src_y, viewport_top),
+        (scale_src_x, 0.0, sample_left, 0.0, scale_src_y, sample_top),
         resample=Image.Resampling.BICUBIC,
     )
 
     if rotation:
         frame = frame.rotate(rotation, resample=Image.Resampling.BICUBIC, expand=False)
+        crop_left = max(0, (sample_size[0] - size[0]) // 2)
+        crop_top = max(0, (sample_size[1] - size[1]) // 2)
+        frame = frame.crop((crop_left, crop_top, crop_left + size[0], crop_top + size[1]))
 
     return frame
 
@@ -334,8 +312,10 @@ class AutoRawGui(tk.Tk):
         self.pending_folder: Path | None = None
         self.tree_path_by_iid: dict[str, Path] = {}
         self.tree_iid_by_path: dict[Path, str] = {}
+        self.drop_window: tk.Toplevel | None = None
 
         self._build_ui()
+        self.after(50, self._enable_drop_target)
         self.after(100, self.process_worker_events)
 
         if initial_folder:
@@ -345,11 +325,12 @@ class AutoRawGui(tk.Tk):
         top = ttk.Frame(self, padding=10)
         top.pack(fill=tk.X)
 
-        self.drop_var = tk.StringVar(value="Перетащите папку на run_gui.bat или вставьте путь сюда")
+        self.drop_var = tk.StringVar(value="Перетащите папку/файл в это окно или вставьте путь сюда")
         self.drop_entry = ttk.Entry(top, textvariable=self.drop_var, font=("Segoe UI", 10))
         self.drop_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(top, text="Загрузить папку", command=self.load_from_entry).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(top, text="...", width=3, command=self.pick_folder).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(top, text="Дроп-окно", command=self.open_drop_window).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(top, text="Экспорт отмеченных", command=self.export_checked).pack(side=tk.LEFT, padx=(12, 0))
         self.use_droplet_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(top, text="Использовать дроплет", variable=self.use_droplet_var).pack(side=tk.LEFT, padx=(12, 0))
@@ -480,10 +461,154 @@ class AutoRawGui(tk.Tk):
         if folder:
             self.load_root(Path(folder))
 
+    def _enable_drop_target(self) -> None:
+        # Safe GUI drag-and-drop (no low-level WinAPI subclassing).
+        if windnd is None:
+            return
+        try:
+            windnd.hook_dropfiles(self, func=self._on_drop_files)
+        except Exception:
+            pass
+
+    def _on_drop_files(self, files) -> None:
+        dropped: list[str] = []
+        for item in files:
+            if isinstance(item, bytes):
+                try:
+                    dropped.append(item.decode("utf-8"))
+                except UnicodeDecodeError:
+                    dropped.append(item.decode("mbcs", errors="ignore"))
+            else:
+                dropped.append(str(item))
+
+        folder = self._path_from_input(" ".join(f'"{item}"' for item in dropped if item))
+        if folder is None:
+            return
+        self.after_idle(lambda: self.load_root(folder))
+
+    def open_drop_window(self) -> None:
+        if self.drop_window and self.drop_window.winfo_exists():
+            self.drop_window.lift()
+            self.drop_window.focus_force()
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Дроп файлов")
+        win.geometry("520x280")
+        win.minsize(460, 240)
+        win.transient(self)
+        win.grab_set()
+        win.configure(bg="#f5f5f5")
+        self.drop_window = win
+
+        panel = tk.Frame(win, bg="#f5f5f5", highlightbackground="#7aa7ff", highlightthickness=2)
+        panel.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+        label = tk.Label(
+            panel,
+            text="Перетащите сюда папку или файл\n\nПосле дропа окно закроется и путь загрузится в GUI",
+            bg="#f5f5f5",
+            fg="#1e1e1e",
+            font=("Segoe UI", 12),
+            justify=tk.CENTER,
+        )
+        label.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        buttons = ttk.Frame(win)
+        buttons.pack(fill=tk.X, padx=16, pady=(0, 12))
+        ttk.Button(buttons, text="Выбрать папку...", command=lambda: self._pick_from_drop_window(win)).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT)
+
+        def _cleanup() -> None:
+            if self.drop_window is win:
+                self.drop_window = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", _cleanup)
+
+        if windnd is None:
+            label.configure(text="windnd не найден.\nИспользуйте кнопку «Выбрать папку...»")
+            return
+
+        def on_drop(files) -> None:
+            dropped: list[str] = []
+            for item in files:
+                if isinstance(item, bytes):
+                    try:
+                        dropped.append(item.decode("utf-8"))
+                    except UnicodeDecodeError:
+                        dropped.append(item.decode("mbcs", errors="ignore"))
+                else:
+                    dropped.append(str(item))
+            folder = self._path_from_input(" ".join(f'"{item}"' for item in dropped if item))
+            if folder is None:
+                return
+
+            def apply_drop() -> None:
+                if win.winfo_exists():
+                    _cleanup()
+                self.load_root(folder)
+
+            self.after_idle(apply_drop)
+
+        try:
+            windnd.hook_dropfiles(win, func=on_drop)
+            windnd.hook_dropfiles(panel, func=on_drop)
+            windnd.hook_dropfiles(label, func=on_drop)
+        except Exception:
+            label.configure(text="Не удалось включить дроп в этом окне.\nИспользуйте кнопку «Выбрать папку...»")
+
+    def _pick_from_drop_window(self, win: tk.Toplevel) -> None:
+        folder = filedialog.askdirectory(title="Выберите корневую папку")
+        if not folder:
+            return
+        if win.winfo_exists():
+            win.destroy()
+        if self.drop_window is win:
+            self.drop_window = None
+        self.load_root(Path(folder))
+
+    def _path_from_input(self, raw: str) -> Path | None:
+        text = raw.strip()
+        if not text:
+            return None
+
+        candidates: list[str] = []
+        try:
+            parts = self.tk.splitlist(text)
+            candidates.extend([str(part) for part in parts if str(part).strip()])
+        except tk.TclError:
+            candidates.append(text)
+
+        if not candidates:
+            candidates.append(text)
+
+        normalized: list[Path] = []
+        for item in candidates:
+            cleaned = item.strip().strip('"').strip("{}").strip()
+            if not cleaned:
+                continue
+            normalized.append(Path(cleaned))
+
+        if not normalized:
+            return None
+
+        for path in normalized:
+            if path.exists():
+                return path if path.is_dir() else path.parent
+
+        first = normalized[0]
+        return first if first.suffix == "" else first.parent
+
     def load_from_entry(self) -> None:
-        self.load_root(Path(self.drop_var.get().strip('" ')))
+        folder = self._path_from_input(self.drop_var.get())
+        if folder is None:
+            messagebox.showerror(APP_NAME, "Укажите путь к папке или файлу.")
+            return
+        self.load_root(folder)
 
     def load_root(self, folder: Path) -> None:
+        if folder.is_file():
+            folder = folder.parent
         if not folder.exists() or not folder.is_dir():
             messagebox.showerror(APP_NAME, f"Папка не найдена:\n{folder}")
             return
@@ -633,7 +758,7 @@ class AutoRawGui(tk.Tk):
             self.worker_events.put(("progress", token, index - 1, total, f"Открываю {path.name}", eta))
             try:
                 img = open_preview(path, max_side=WORKING_MAX_SIDE)
-                frames.append(FrameState(path=path, frame=frame_id(path), image=img, crop_box=auto_crop(path, img, aspect)))
+                frames.append(FrameState(path=path, frame=frame_id(path), image=img, crop_box=compute_auto_crop_box(path, img, aspect)))
             except Exception as exc:
                 self.worker_events.put(("warning", token, f"Не удалось открыть {path.name}:\n{exc}"))
 
@@ -664,7 +789,7 @@ class AutoRawGui(tk.Tk):
         for path in direct_image_files(folder)[:8]:
             try:
                 img = open_preview(path, max_side=WORKING_MAX_SIDE)
-                frames.append(FrameState(path=path, frame=frame_id(path), image=img, crop_box=auto_crop(path, img, aspect)))
+                frames.append(FrameState(path=path, frame=frame_id(path), image=img, crop_box=compute_auto_crop_box(path, img, aspect)))
             except Exception as exc:
                 messagebox.showwarning(APP_NAME, f"Не удалось открыть {path.name}:\n{exc}")
 
@@ -725,7 +850,24 @@ class AutoRawGui(tk.Tk):
         var.set(value)
         return value
 
+    def _save_controls_to_current(self) -> None:
+        if self._updating_controls:
+            return
+        state = self.current()
+        if not state:
+            return
+        state.offset_x = self.offset_x.get()
+        state.offset_y = self.offset_y.get()
+        state.zoom = self.zoom.get() or 1.0
+        state.rotation = self.rotation.get()
+        state.profile = self.profile_var.get() or STANDARD_PROFILE
+        state.contrast = self._coerce_int(self.contrast_var, STANDARD_CONTRAST, -100, 100)
+        state.shadows = self._coerce_int(self.shadows_var, STANDARD_SHADOWS, -100, 100)
+        state.temperature = self._coerce_int(self.temperature_var, STANDARD_TEMPERATURE, 2000, 10000)
+        state.tint = self._coerce_int(self.tint_var, STANDARD_TINT, -100, 100)
+
     def select_frame(self, index: int) -> None:
+        self._save_controls_to_current()
         frames = self.current_frames()
         if not frames:
             self.info_var.set("В выбранной папке нет кадров")
@@ -766,15 +908,7 @@ class AutoRawGui(tk.Tk):
         state = self.current()
         if not state:
             return
-        state.offset_x = self.offset_x.get()
-        state.offset_y = self.offset_y.get()
-        state.zoom = self.zoom.get() or 1.0
-        state.rotation = self.rotation.get()
-        state.profile = self.profile_var.get() or STANDARD_PROFILE
-        state.contrast = self._coerce_int(self.contrast_var, STANDARD_CONTRAST, -100, 100)
-        state.shadows = self._coerce_int(self.shadows_var, STANDARD_SHADOWS, -100, 100)
-        state.temperature = self._coerce_int(self.temperature_var, STANDARD_TEMPERATURE, 2000, 10000)
-        state.tint = self._coerce_int(self.tint_var, STANDARD_TINT, -100, 100)
+        self._save_controls_to_current()
         state.thumb_cache = None
         self.render_preview()
 
@@ -891,7 +1025,7 @@ class AutoRawGui(tk.Tk):
         self.select_frame(self.selected_index)
 
     def export_checked(self) -> None:
-        self.update_current()
+        self._save_controls_to_current()
         if self.loading_frames:
             messagebox.showwarning(APP_NAME, "Дождитесь окончания загрузки превью")
             return
@@ -948,7 +1082,7 @@ class AutoRawGui(tk.Tk):
                     self.worker_events.put(("progress", token, done_units, total_units, f"Открываю {folder.name}\\{path.name}", eta))
                     try:
                         img = open_preview(path, max_side=WORKING_MAX_SIDE)
-                        frames.append(FrameState(path=path, frame=frame_id(path), image=img, crop_box=auto_crop(path, img, aspect)))
+                        frames.append(FrameState(path=path, frame=frame_id(path), image=img, crop_box=compute_auto_crop_box(path, img, aspect)))
                     except Exception as exc:
                         self.worker_events.put(("warning", token, f"Не удалось открыть {path.name}:\n{exc}"))
                     done_units += 1
@@ -964,14 +1098,9 @@ class AutoRawGui(tk.Tk):
                 elapsed = time.monotonic() - start_time
                 eta = (elapsed / max(1, done_units) * max(0, total_units - done_units)) if done_units else 0.0
                 self.worker_events.put(("progress", token, done_units, total_units, f"Экспорт {folder.name}\\{frame.path.stem}.jpg", eta))
-                # Export from full-size source for maximum JPG quality while
-                # preserving editor adjustments by scaling crop box.
-                try:
-                    export_image = open_preview(frame.path, max_side=None)
-                except Exception:
-                    export_image = frame.image
-
-                export_crop = scale_box(frame.crop_box, frame.image.size, export_image.size)
+                # Экспорт в том же разрешении, что и редактор — иначе crop_box и смещения расходятся.
+                export_image = frame.image
+                export_crop = frame.crop_box
                 output = render_frame(frame, CANVAS_SIZE, source_image=export_image, crop_box=export_crop)
                 output = apply_standard_look(
                     output,
@@ -1101,7 +1230,21 @@ class AutoRawGui(tk.Tk):
 
 
 def main() -> int:
-    folder = Path(sys.argv[1]) if len(sys.argv) > 1 else None
+    folder: Path | None = None
+    if len(sys.argv) > 1:
+        raw_items = [arg for arg in sys.argv[1:] if arg.strip()]
+        parsed: list[Path] = []
+        for item in raw_items:
+            cleaned = item.strip().strip('"').strip("{}").strip()
+            if cleaned:
+                parsed.append(Path(cleaned))
+        for path in parsed:
+            if path.exists():
+                folder = path if path.is_dir() else path.parent
+                break
+        if folder is None and parsed:
+            first = parsed[0]
+            folder = first if first.suffix == "" else first.parent
     app = AutoRawGui(folder)
     app.mainloop()
     return 0

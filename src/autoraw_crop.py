@@ -79,6 +79,7 @@ class LayoutRule:
 
 
 CANVAS_SIZE = (1400, 1050)
+DETECT_MAX_SIDE = 1200
 
 LAYOUT_RULES = {
     "01": LayoutRule(
@@ -291,7 +292,9 @@ def largest_component_box(mask: np.ndarray) -> tuple[Box | None, int]:
         if touches_left_right or too_wide or too_low_band:
             continue
 
-        if count > best_count:
+        area = candidate.width * candidate.height
+        best_area = best_box.width * best_box.height if best_box else 0
+        if count > best_count or (count == best_count and area > best_area):
             best_count = count
             best_box = candidate
 
@@ -328,6 +331,46 @@ def clean_bounds_mask(mask: np.ndarray) -> np.ndarray:
     cleaned[np.mean(cleaned, axis=1) > 0.65, :] = False
     cleaned[:, np.mean(cleaned, axis=0) > 0.65] = False
     return cleaned
+
+
+def scale_box(box: Box, source_size: tuple[int, int], target_size: tuple[int, int]) -> Box:
+    sx = target_size[0] / source_size[0]
+    sy = target_size[1] / source_size[1]
+    return Box(
+        int(box.left * sx),
+        int(box.top * sy),
+        int(box.right * sx),
+        int(box.bottom * sy),
+    ).clamp(*target_size)
+
+
+def detect_object_on_image(img: Image.Image, rule: LayoutRule | None) -> tuple[Box | None, float]:
+    """Детекция на том же кадре, что и превью; при больших RAW — до DETECT_MAX_SIDE px."""
+    analysis = img.copy()
+    if max(analysis.size) > DETECT_MAX_SIDE:
+        analysis.thumbnail((DETECT_MAX_SIDE, DETECT_MAX_SIDE), Image.Resampling.LANCZOS)
+    detected, confidence = detect_object(
+        analysis,
+        combine_components=bool(rule and rule.combine_components),
+    )
+    if detected is None:
+        return None, confidence
+    return scale_box(detected, analysis.size, img.size), confidence
+
+
+def compute_auto_crop_box(path: Path, img: Image.Image, aspect: float) -> Box:
+    frame = frame_id(path)
+    rule = LAYOUT_RULES.get(frame)
+    object_box, _ = detect_object_on_image(img, rule)
+
+    if object_box and rule and not rule.manual_only:
+        layout_box = expand_box(object_box, img.size, rule)
+        return crop_from_rule(layout_box, img.size, aspect, rule)
+
+    if object_box:
+        return crop_from_object(object_box, img.size, aspect, padding=0.11)
+
+    return Box(0, 0, img.width, img.height)
 
 
 def detect_object(img: Image.Image, combine_components: bool = False) -> tuple[Box | None, float]:
@@ -548,7 +591,7 @@ def process_file(path: Path, output_dir: Path, aspect: float, padding: float) ->
     img = open_preview(path)
     frame = frame_id(path)
     rule = LAYOUT_RULES.get(frame)
-    object_box, confidence = detect_object(img, combine_components=bool(rule and rule.combine_components))
+    object_box, confidence = detect_object_on_image(img, rule)
     layout_box = expand_box(object_box, img.size, rule) if object_box else None
 
     if rule and rule.manual_only:

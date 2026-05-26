@@ -24,10 +24,10 @@ exit /b 1
 for /f "delims=" %%V in ('"%PYTHON_EXE%" -c "import sys; sys.path.insert(0,'%~dp0src'); from version import VERSION; print(VERSION)" 2^>nul') do set "APP_VERSION=%%V"
 if /I not "%~1"=="deps" exit /b 0
 
-"%PYTHON_EXE%" -c "import PIL, numpy" >nul 2>&1
+"%PYTHON_EXE%" -c "import PIL, numpy, windnd" >nul 2>&1
 if not errorlevel 1 exit /b 0
 
 echo.
-echo Installing runtime dependencies (Pillow, numpy)...
+echo Installing runtime dependencies (Pillow, numpy, windnd)...
 "%PYTHON_EXE%" -m pip install -r "%~dp0requirements.txt"
 exit /b %errorlevel%

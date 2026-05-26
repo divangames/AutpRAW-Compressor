@@ -1,6 +1,6 @@
 # AutoRAW Compressor
 
-**Версия: 0.0.0.1.ProtoAlpha**
+**Версия: 0.0.0.2.ProtoAlpha**
 
 Прототип массового автокадрирования для съёмки кроссовок: распознаёт товар на светлом фоне, применяет правила посадки по номеру кадра и готовит план кропа для Photoshop. Есть CLI и GUI с ручной подстройкой и экспортом.
 
@@ -147,7 +147,7 @@ Remote: `gitverse` → `https://gitverse.ru/delbraun/AutoRAWCompressor.git`
 | `W` | `VERSION_PATCH` | Мелкие исправления и мелкие нововведения |
 | Codename | `VERSION_CODENAME` | Название сборки (`ProtoAlpha`, …) |
 
-Строка версии: `X.Y.Z.W.Codename` (сейчас **0.0.0.1.ProtoAlpha**).
+Строка версии: `X.Y.Z.W.Codename` (сейчас **0.0.0.2.ProtoAlpha**).
 
 Отображается в заголовке GUI, `--version` CLI, меню `build.bat` и `dist/README.txt` после сборки.
 
