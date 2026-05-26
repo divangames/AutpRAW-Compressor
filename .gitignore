@@ -1,0 +1,31 @@
+# Сборка и артефакты PyInstaller
+/dist/
+/build/_staging/
+/build/pyinstaller/
+*.spec.bak
+
+# Выходные данные обработки
+/output/
+/output_*/
+/output_gui_test/
+
+# Тестовые RAW (локально, не в Git)
+/test/
+*.NEF
+*.nef
+*.dng
+*.DNG
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.env
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
