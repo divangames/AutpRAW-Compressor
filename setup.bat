@@ -11,6 +11,7 @@ if errorlevel 1 (
 
 echo.
 echo Python: %PYTHON_EXE%
+if defined APP_VERSION echo Version: %APP_VERSION%
 echo.
 
 echo Installing runtime dependencies...

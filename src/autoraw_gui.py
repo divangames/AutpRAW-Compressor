@@ -14,6 +14,7 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageEnhance, ImageOps, ImageTk
 
 from app_paths import resource_path
+from version import APP_NAME, APP_TITLE
 from autoraw_crop import (
     CANVAS_SIZE,
     LAYOUT_RULES,
@@ -315,7 +316,7 @@ def apply_standard_look(
 class AutoRawGui(tk.Tk):
     def __init__(self, initial_folder: Path | None = None) -> None:
         super().__init__()
-        self.title("AutoRAW Compressor")
+        self.title(APP_TITLE)
         self.geometry("1320x820")
         self.minsize(1180, 760)
 
@@ -484,7 +485,7 @@ class AutoRawGui(tk.Tk):
 
     def load_root(self, folder: Path) -> None:
         if not folder.exists() or not folder.is_dir():
-            messagebox.showerror("AutoRAW", f"Папка не найдена:\n{folder}")
+            messagebox.showerror(APP_NAME, f"Папка не найдена:\n{folder}")
             return
 
         self.load_token += 1
@@ -514,7 +515,7 @@ class AutoRawGui(tk.Tk):
             return
         if not found:
             self.set_progress(0, "Папки с исходниками не найдены")
-            messagebox.showerror("AutoRAW", "Не найдено папок с исходниками")
+            messagebox.showerror(APP_NAME, "Не найдено папок с исходниками")
             return
 
         old_states = self.folder_states
@@ -665,7 +666,7 @@ class AutoRawGui(tk.Tk):
                 img = open_preview(path, max_side=WORKING_MAX_SIDE)
                 frames.append(FrameState(path=path, frame=frame_id(path), image=img, crop_box=auto_crop(path, img, aspect)))
             except Exception as exc:
-                messagebox.showwarning("AutoRAW", f"Не удалось открыть {path.name}:\n{exc}")
+                messagebox.showwarning(APP_NAME, f"Не удалось открыть {path.name}:\n{exc}")
 
         state.frames = frames
         return frames
@@ -892,11 +893,11 @@ class AutoRawGui(tk.Tk):
     def export_checked(self) -> None:
         self.update_current()
         if self.loading_frames:
-            messagebox.showwarning("AutoRAW", "Дождитесь окончания загрузки превью")
+            messagebox.showwarning(APP_NAME, "Дождитесь окончания загрузки превью")
             return
         checked_folders = [state.path for state in self.folder_states.values() if state.checked]
         if not checked_folders:
-            messagebox.showerror("AutoRAW", "Нет отмеченных папок для экспорта")
+            messagebox.showerror(APP_NAME, "Нет отмеченных папок для экспорта")
             return
 
         self.load_token += 1
@@ -1084,17 +1085,17 @@ class AutoRawGui(tk.Tk):
                     msg = f"Экспорт готов. Файлов: {exported}"
                     if droplet_processed:
                         msg += f"\nЧерез дроплеты обработано: {droplet_processed}"
-                    messagebox.showinfo("AutoRAW", msg)
+                    messagebox.showinfo(APP_NAME, msg)
             elif kind == "warning":
                 _, token, text = event
                 if token == self.load_token:
-                    messagebox.showwarning("AutoRAW", text)
+                    messagebox.showwarning(APP_NAME, text)
             elif kind == "error":
                 _, token, text = event
                 if token == self.load_token:
                     self.loading_frames = False
                     self.set_progress(0, "Ошибка")
-                    messagebox.showerror("AutoRAW", text)
+                    messagebox.showerror(APP_NAME, text)
 
         self.after(100, self.process_worker_events)
 

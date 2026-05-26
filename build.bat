@@ -22,7 +22,7 @@ goto help
 
 :menu
 echo.
-echo AutoRAW Compressor - build menu
+if defined APP_VERSION (echo AutoRAW Compressor %APP_VERSION% - build menu) else (echo AutoRAW Compressor - build menu)
 echo   1 - Build dist\AutoRAWCompressor
 echo   2 - Clean build artifacts
 echo   3 - Run GUI from dist

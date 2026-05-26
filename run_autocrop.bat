@@ -15,7 +15,7 @@ set "INPUT_DIR=test"
 set "REFERENCE_DIR=reference\Sneakers"
 set "OUTPUT_DIR=output"
 
-echo AutoRAW Compressor
+if defined APP_VERSION (echo AutoRAW Compressor %APP_VERSION%) else (echo AutoRAW Compressor)
 echo Input:     %INPUT_DIR%
 echo Reference: %REFERENCE_DIR%
 echo Output:    %OUTPUT_DIR%

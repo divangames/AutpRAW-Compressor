@@ -8,6 +8,10 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+SRC = ROOT / "src"
+sys.path.insert(0, str(SRC))
+from version import APP_NAME, VERSION, version_string  # noqa: E402
+
 DIST_DIR = ROOT / "dist" / "AutoRAWCompressor"
 WORK_DIR = ROOT / "build" / "pyinstaller"
 STAGING = ROOT / "build" / "_staging"
@@ -115,7 +119,7 @@ def write_launchers(target: Path) -> None:
                 "set INPUT_DIR=test",
                 "set REFERENCE_DIR=reference\\Sneakers",
                 "set OUTPUT_DIR=output",
-                "echo AutoRAW Compressor (build)",
+                f"echo {APP_NAME} {VERSION} (build)",
                 "echo Input:     %INPUT_DIR%",
                 "echo Reference: %REFERENCE_DIR%",
                 "echo Output:    %OUTPUT_DIR%",
@@ -133,7 +137,8 @@ def write_launchers(target: Path) -> None:
     (target / "README.txt").write_text(
         "\n".join(
             [
-                "AutoRAW Compressor — portable build",
+                f"{APP_NAME} — portable build",
+                f"Версия: {version_string()}",
                 "",
                 "Запуск:",
                 "  AutoRAW-GUI.exe   — графический интерфейс",

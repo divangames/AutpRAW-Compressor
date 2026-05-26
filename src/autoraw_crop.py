@@ -12,6 +12,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from app_paths import resource_path
+from version import APP_NAME, VERSION, version_string
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".nef", ".dng"}
@@ -617,7 +618,11 @@ function applyNormalizedCrop(crop) {
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Auto crop sneakers from RAW previews.")
+    parser = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description=f"Auto crop sneakers from RAW previews. Version {VERSION}.",
+    )
+    parser.add_argument("--version", action="version", version=version_string())
     parser.add_argument("--input", default="test", help="Input file or directory.")
     parser.add_argument(
         "--reference",

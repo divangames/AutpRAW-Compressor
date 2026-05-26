@@ -21,6 +21,7 @@ echo Or: winget install Python.Python.3.12
 exit /b 1
 
 :python_ok
+for /f "delims=" %%V in ('"%PYTHON_EXE%" -c "import sys; sys.path.insert(0,'%~dp0src'); from version import VERSION; print(VERSION)" 2^>nul') do set "APP_VERSION=%%V"
 if /I not "%~1"=="deps" exit /b 0
 
 "%PYTHON_EXE%" -c "import PIL, numpy" >nul 2>&1
