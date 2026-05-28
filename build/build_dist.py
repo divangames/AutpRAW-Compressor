@@ -17,7 +17,7 @@ WORK_DIR = ROOT / "build" / "pyinstaller"
 STAGING = ROOT / "build" / "_staging"
 SPEC = ROOT / "build" / "AutoRAW.spec"
 
-ASSET_DIRS = ("reference", "rules", "color")
+ASSET_DIRS = ("reference", "rules", "color", "assets")
 
 
 def ensure_pyinstaller() -> None:
@@ -67,9 +67,9 @@ def run_pyinstaller() -> Path:
         "AutoRAW-Crop",
         "--hidden-import",
         "PIL._tkinter_finder",
-        "--collect-submodules",
+        "--collect-all",
         "PIL",
-        "--collect-submodules",
+        "--collect-all",
         "numpy",
         str(ROOT / "src" / "autoraw_crop.py"),
     ]
