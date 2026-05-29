@@ -46,6 +46,7 @@ from autoraw_crop import (
     LAYOUT_RULES,
     Box,
     compute_auto_crop_box,
+    detect_object_on_image,
     frame_id,
     image_files,
     open_preview,
@@ -193,6 +194,7 @@ def _save_theme_choice(choice: str) -> None:
 # Apply initial palette so module-level constants are set before class creation
 _apply_palette("dark")
 REFERENCE_DIR = resource_path("reference", "Sneakers")
+SEARCH_REFERENCE_DIR = REFERENCE_DIR / "search"
 WORKING_MAX_SIDE = 2600
 STANDARD_PROFILE = "Adobe Стандарт"
 STANDARD_CONTRAST = 20
@@ -218,6 +220,7 @@ class FrameState:
     frame: str
     image: Image.Image
     crop_box: Box
+    match_score: float | None = None
     checked: bool = True
     offset_x: float = 0.0
     offset_y: float = 0.0
@@ -258,6 +261,142 @@ def direct_image_files(folder: Path) -> list[Path]:
             by_frame[frame] = path
 
     return sorted(by_frame.values(), key=frame_sort_key)
+
+
+MATCH_SIZE = (96, 72)
+_SEARCH_SIGNATURES: dict[str, tuple[list[float], list[float], tuple[float, float, float, float]]] | None = None
+
+
+def _frame_label_from_path(path: Path) -> str | None:
+    frame = frame_id(path)
+    return frame if frame.isdigit() and 1 <= int(frame) <= 99 else None
+
+
+def _fit_gray_vector(img: Image.Image) -> list[float]:
+    gray = ImageOps.autocontrast(img.convert("L"))
+    gray = ImageOps.fit(gray, MATCH_SIZE, Image.Resampling.LANCZOS)
+    return [px / 255.0 for px in gray.tobytes()]
+
+
+def _image_signature(img: Image.Image) -> tuple[list[float], list[float], tuple[float, float, float, float]]:
+    oriented = ImageOps.exif_transpose(img).convert("RGB")
+    full_vec = _fit_gray_vector(oriented)
+    box, _ = detect_object_on_image(oriented, None)
+
+    if box is None:
+        obj = oriented
+        geom = (1.0, 1.0, 0.5, 0.5)
+    else:
+        pad_x = int(box.width * 0.08)
+        pad_y = int(box.height * 0.08)
+        crop_box = Box(
+            box.left - pad_x,
+            box.top - pad_y,
+            box.right + pad_x,
+            box.bottom + pad_y,
+        ).clamp(oriented.width, oriented.height)
+        obj = oriented.crop((crop_box.left, crop_box.top, crop_box.right, crop_box.bottom))
+        geom = (
+            box.width / max(1, oriented.width),
+            box.height / max(1, oriented.height),
+            (box.left + box.right) / (2 * max(1, oriented.width)),
+            (box.top + box.bottom) / (2 * max(1, oriented.height)),
+        )
+
+    return full_vec, _fit_gray_vector(obj), geom
+
+
+def _vector_distance(a: list[float], b: list[float]) -> float:
+    return sum(abs(x - y) for x, y in zip(a, b)) / max(1, min(len(a), len(b)))
+
+
+def _signature_distance(
+    a: tuple[list[float], list[float], tuple[float, float, float, float]],
+    b: tuple[list[float], list[float], tuple[float, float, float, float]],
+) -> float:
+    full_a, obj_a, geom_a = a
+    full_b, obj_b, geom_b = b
+    geom = sum(abs(x - y) for x, y in zip(geom_a, geom_b)) / 4.0
+    return _vector_distance(full_a, full_b) * 0.35 + _vector_distance(obj_a, obj_b) * 0.55 + geom * 0.10
+
+
+def _load_search_signatures() -> dict[str, tuple[list[float], list[float], tuple[float, float, float, float]]]:
+    global _SEARCH_SIGNATURES
+    if _SEARCH_SIGNATURES is not None:
+        return _SEARCH_SIGNATURES
+
+    signatures: dict[str, tuple[list[float], list[float], tuple[float, float, float, float]]] = {}
+    if SEARCH_REFERENCE_DIR.is_dir():
+        for path in sorted(SEARCH_REFERENCE_DIR.iterdir(), key=frame_sort_key):
+            if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
+                continue
+            frame = _frame_label_from_path(path)
+            if not frame:
+                continue
+            try:
+                with Image.open(path) as img:
+                    signatures[frame] = _image_signature(img)
+            except Exception:
+                continue
+
+    _SEARCH_SIGNATURES = signatures
+    return signatures
+
+
+def assign_frames_by_search(
+    loaded: list[tuple[Path, Image.Image]],
+) -> list[tuple[Path, Image.Image, str, float | None]]:
+    """Assign source images to frame numbers using reference/Sneakers/search."""
+    refs = _load_search_signatures()
+    if not refs:
+        return [(path, img, frame_id(path), None) for path, img in loaded]
+
+    source_sigs: list[tuple[int, tuple[list[float], list[float], tuple[float, float, float, float]]]] = []
+    for index, (_path, img) in enumerate(loaded):
+        try:
+            source_sigs.append((index, _image_signature(img)))
+        except Exception:
+            continue
+
+    pairs: list[tuple[float, int, str]] = []
+    for index, sig in source_sigs:
+        for frame, ref_sig in refs.items():
+            pairs.append((_signature_distance(sig, ref_sig), index, frame))
+    pairs.sort(key=lambda item: item[0])
+
+    assigned_by_index: dict[int, tuple[str, float]] = {}
+    used_frames: set[str] = set()
+    for score, index, frame in pairs:
+        if index in assigned_by_index or frame in used_frames:
+            continue
+        assigned_by_index[index] = (frame, score)
+        used_frames.add(frame)
+        if len(assigned_by_index) == min(len(loaded), len(refs)):
+            break
+
+    fallback_frames = [frame for frame in sorted(refs, key=lambda f: int(f)) if frame not in used_frames]
+    result: list[tuple[Path, Image.Image, str, float | None]] = []
+    for index, (path, img) in enumerate(loaded):
+        if index in assigned_by_index:
+            frame, score = assigned_by_index[index]
+        elif fallback_frames:
+            frame, score = fallback_frames.pop(0), None
+        else:
+            frame, score = frame_id(path), None
+        result.append((path, img, frame, score))
+
+    return sorted(result, key=lambda item: (int(item[2]) if item[2].isdigit() else 999, item[0].name.lower()))
+
+
+def crop_box_for_assigned_frame(path: Path, img: Image.Image, aspect: float, frame: str) -> Box:
+    fake_path = Path(f"{frame}{path.suffix}")
+    return compute_auto_crop_box(fake_path, img, aspect)
+
+
+def export_name_for_frame(frame: FrameState) -> str:
+    if frame.frame.isdigit():
+        return f"{int(frame.frame)}.jpg"
+    return f"{frame.path.stem}.jpg"
 
 
 def has_direct_sources(folder: Path) -> bool:
@@ -1983,7 +2122,7 @@ class AutoRawGui(tk.Tk):
         aspect = target_aspect(REFERENCE_DIR)
         paths = direct_image_files(folder)[:8]
         total = len(paths)
-        frames: list[FrameState] = []
+        loaded: list[tuple[Path, Image.Image]] = []
         start_time = time.monotonic()
 
         for index, path in enumerate(paths, start=1):
@@ -1992,9 +2131,21 @@ class AutoRawGui(tk.Tk):
             self.worker_events.put(("progress", token, index - 1, total, f"Открываю {path.name}", eta))
             try:
                 img = open_preview(path, max_side=WORKING_MAX_SIDE)
-                frames.append(FrameState(path=path, frame=frame_id(path), image=img, crop_box=compute_auto_crop_box(path, img, aspect)))
+                loaded.append((path, img))
             except Exception as exc:
                 self.worker_events.put(("warning", token, f"Не удалось открыть {path.name}:\n{exc}"))
+
+        self.worker_events.put(("progress", token, total, total, "Определяю порядок кадров по search-эталонам", 0.0))
+        frames = [
+            FrameState(
+                path=path,
+                frame=frame,
+                image=img,
+                crop_box=crop_box_for_assigned_frame(path, img, aspect, frame),
+                match_score=score,
+            )
+            for path, img, frame, score in assign_frames_by_search(loaded)
+        ]
 
         elapsed = time.monotonic() - start_time
         self.worker_events.put(("frames_done", token, folder, frames, elapsed))
@@ -2019,14 +2170,24 @@ class AutoRawGui(tk.Tk):
             return state.frames
 
         aspect = target_aspect(REFERENCE_DIR)
-        frames: list[FrameState] = []
+        loaded: list[tuple[Path, Image.Image]] = []
         for path in direct_image_files(folder)[:8]:
             try:
                 img = open_preview(path, max_side=WORKING_MAX_SIDE)
-                frames.append(FrameState(path=path, frame=frame_id(path), image=img, crop_box=compute_auto_crop_box(path, img, aspect)))
+                loaded.append((path, img))
             except Exception as exc:
                 messagebox.showwarning(APP_NAME, f"Не удалось открыть {path.name}:\n{exc}")
 
+        frames = [
+            FrameState(
+                path=path,
+                frame=frame,
+                image=img,
+                crop_box=crop_box_for_assigned_frame(path, img, aspect, frame),
+                match_score=score,
+            )
+            for path, img, frame, score in assign_frames_by_search(loaded)
+        ]
         state.frames = frames
         return frames
 
@@ -2102,7 +2263,11 @@ class AutoRawGui(tk.Tk):
 
             badge_row = tk.Frame(card, bg=FIG_SURFACE)
             badge_row.pack(fill=tk.X, pady=(0, 2))
-            tk.Label(badge_row, text=f"  {state.frame}", bg=FIG_ACCENT if is_selected else FIG_BTN,
+            score_text = ""
+            if state.match_score is not None:
+                confidence = max(0, min(99, int(round((1.0 - state.match_score) * 100))))
+                score_text = f" · {confidence}%"
+            tk.Label(badge_row, text=f"  {state.frame}{score_text}", bg=FIG_ACCENT if is_selected else FIG_BTN,
                      fg="#ffffff", font=("Segoe UI", 8, "bold"),
                      padx=4, pady=1).pack(side=tk.LEFT)
             chk = self._make_check(
@@ -2218,9 +2383,13 @@ class AutoRawGui(tk.Tk):
         self.tint_var.set(state.tint)
         self._updating_controls = False
         folder_text = self.selected_folder.name if self.selected_folder else ""
+        match_text = ""
+        if state.match_score is not None:
+            confidence = max(0, min(99, int(round((1.0 - state.match_score) * 100))))
+            match_text = f" · авто {confidence}%"
         self.info_var.set(
             f"📁  {folder_text}\n"
-            f"🖼  {state.frame} — {state.path.name}\n"
+            f"🖼  {state.frame}{match_text} — {state.path.name}\n"
             f"⌨  Стрелки / мышь / колесо"
         )
         self.preview.focus_set()
@@ -2358,10 +2527,14 @@ class AutoRawGui(tk.Tk):
         """Auto-select the matching reference image for the current frame.
 
         Looks for:  <root_folder>/reference/<selected_folder_name>/<images sorted>
-        and picks the image at self.selected_index (clamped to available count).
+        and picks the image matching the assigned frame number (1.jpg..8.jpg).
         Falls back to the manually saved etalon path if no reference folder is found.
         """
         if not self.root_folder or not self.selected_folder:
+            self._display_etalon(self._etalon_path)
+            return
+        state = self.current()
+        if state is None:
             self._display_etalon(self._etalon_path)
             return
 
@@ -2391,16 +2564,27 @@ class AutoRawGui(tk.Tk):
             self._display_etalon(self._etalon_path)
             return
 
+        candidates: list[Path] = []
+        if state.frame.isdigit():
+            n = int(state.frame)
+            for stem in (str(n), f"{n:02d}"):
+                candidates.extend(ref_subdir / f"{stem}{ext}" for ext in self._IMG_EXTS)
+
+        for candidate in candidates:
+            if candidate.is_file():
+                self._display_etalon(str(candidate))
+                return
+
+        # Fallback for old reference packs where only sorted files exist.
         images = sorted(
             f for f in ref_subdir.iterdir()
             if f.is_file() and f.suffix.lower() in self._IMG_EXTS
         )
-        if not images:
+        if images:
+            idx = min(self.selected_index, len(images) - 1)
+            self._display_etalon(str(images[idx]))
+        else:
             self._display_etalon(self._etalon_path)
-            return
-
-        idx = min(self.selected_index, len(images) - 1)
-        self._display_etalon(str(images[idx]))
 
     # ══════════════════════════════════════════════════════════════
     #  System status bar
@@ -3427,7 +3611,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
                 source_paths = direct_image_files(folder)[:8]
                 total_units += len(source_paths) * 2
                 if use_droplets:
-                    total_units += len([path for path in source_paths if frame_id(path) in DROPLET_BY_FRAME])
+                    total_units += len(source_paths)
             else:
                 checked_frames = [frame for frame in folder_state.frames if frame.checked]
                 total_units += len(checked_frames)
@@ -3449,7 +3633,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
 
             frames = folder_state.frames
             if frames is None:
-                frames = []
+                loaded: list[tuple[Path, Image.Image]] = []
                 paths = direct_image_files(folder)[:8]
                 for path in paths:
                     elapsed = time.monotonic() - start_time
@@ -3457,10 +3641,20 @@ AutoRAW Compressor — инструмент пакетной обработки 
                     self.worker_events.put(("progress", token, done_units, total_units, f"Открываю {folder.name}\\{path.name}", eta))
                     try:
                         img = open_preview(path, max_side=WORKING_MAX_SIDE)
-                        frames.append(FrameState(path=path, frame=frame_id(path), image=img, crop_box=compute_auto_crop_box(path, img, aspect)))
+                        loaded.append((path, img))
                     except Exception as exc:
                         self.worker_events.put(("warning", token, f"Не удалось открыть {path.name}:\n{exc}"))
                     done_units += 1
+                frames = [
+                    FrameState(
+                        path=path,
+                        frame=frame,
+                        image=img,
+                        crop_box=crop_box_for_assigned_frame(path, img, aspect, frame),
+                        match_score=score,
+                    )
+                    for path, img, frame, score in assign_frames_by_search(loaded)
+                ]
                 folder_state.frames = frames
 
             checked_frames = [frame for frame in frames if frame.checked]
@@ -3472,7 +3666,8 @@ AutoRAW Compressor — инструмент пакетной обработки 
             for frame in checked_frames:
                 elapsed = time.monotonic() - start_time
                 eta = (elapsed / max(1, done_units) * max(0, total_units - done_units)) if done_units else 0.0
-                self.worker_events.put(("progress", token, done_units, total_units, f"Экспорт {folder.name}\\{frame.path.stem}.jpg", eta))
+                export_name = export_name_for_frame(frame)
+                self.worker_events.put(("progress", token, done_units, total_units, f"Экспорт {folder.name}\\{export_name}", eta))
                 # Экспорт в том же разрешении, что и редактор — иначе crop_box и смещения расходятся.
                 export_image = frame.image
                 export_crop = frame.crop_box
@@ -3485,7 +3680,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
                         temperature=frame.temperature,
                         tint=frame.tint,
                     )
-                output_path = output_dir / f"{frame.path.stem}.jpg"
+                output_path = output_dir / export_name
                 output.save(
                     output_path,
                     format="JPEG",

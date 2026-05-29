@@ -1,11 +1,10 @@
 """Версия AutoRAW Compressor — меняйте числа и кодовое имя здесь.
 
-Схема X.Y.Z.W.B.Codename:
+Схема X.Y.Z.W.Codename:
   X (VERSION_MAJOR)   — глобальное обновление продукта (Soft 2, Soft 3, …)
   Y (VERSION_SEMI)    — полуглобальные изменения
   Z (VERSION_FEATURE) — нововведения и изменения функций
   W (VERSION_PATCH)   — мелкие исправления и мелкие нововведения
-  B (VERSION_BUILD)   — технический номер сборки
   Codename            — название сборки (ProtoAlpha, Beta, …)
 """
 
@@ -14,15 +13,14 @@ from __future__ import annotations
 VERSION_MAJOR = 0
 VERSION_SEMI = 0
 VERSION_FEATURE = 1
-VERSION_PATCH = 0
-VERSION_BUILD = 0
+VERSION_PATCH = 5
 VERSION_CODENAME = "ProtoAlpha"
 
 APP_NAME = "AutoRAW Compressor"
 
 
 def version_string() -> str:
-    return f"{VERSION_MAJOR}.{VERSION_SEMI}.{VERSION_FEATURE}.{VERSION_PATCH}.{VERSION_BUILD}.{VERSION_CODENAME}"
+    return f"{VERSION_MAJOR}.{VERSION_SEMI}.{VERSION_FEATURE}.{VERSION_PATCH}.{VERSION_CODENAME}"
 
 
 VERSION = version_string()
