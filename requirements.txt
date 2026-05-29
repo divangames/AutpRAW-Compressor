@@ -1,3 +1,5 @@
 Pillow>=10.0
 numpy>=1.26
 windnd
+psutil>=5.9
+# optional GPU monitoring (NVIDIA only): pip install pynvml

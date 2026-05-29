@@ -5,12 +5,32 @@ import sys
 import queue
 import subprocess
 import threading
+
+# Windows: locale cp1251 ломает чтение stdout wmic/nvidia-smi/дроплетов в _readerthread
+_SUBPROC_TEXT = dict(capture_output=True, text=True, encoding="utf-8", errors="replace")
 import time
 import math
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+
+import socket
+
+try:
+    import psutil as _psutil  # type: ignore[import-not-found]
+except ImportError:
+    _psutil = None  # type: ignore[assignment]
+
+try:
+    import pynvml as _pynvml  # type: ignore[import-not-found]
+    _pynvml.nvmlInit()
+    _GPU_HANDLE = _pynvml.nvmlDeviceGetHandleByIndex(0)
+    _HAS_GPU = True
+except Exception:
+    _pynvml = None  # type: ignore[assignment]
+    _GPU_HANDLE = None
+    _HAS_GPU = False
 
 try:
     import windnd  # type: ignore[import-not-found]
@@ -42,23 +62,23 @@ ZOOM_MAX = 3.0
 # ── Palettes (Light / Dark) ──────────────────────────────────────
 _PALETTES: dict[str, dict[str, str]] = {
     "dark": dict(
-        BG="#1c1c1c", PANEL="#252525", PANEL_L="#303030",
-        SURFACE="#2b2b2b", BORDER="#3d3d3d",
-        TEXT="#d4d4d4", TEXT2="#888888",
-        ACCENT="#4b9ef0", ACCENT_H="#6cb3ff",
-        SEL="#1f4275", INPUT="#1a1a1a", BTN="#3c3c3c",
-        SL_TRACK="#111111", SL_ACTIVE="#4b9ef0",
-        SL_THUMB="#a0a8b0", SL_THUMB_BD="#6a7280",
-        PREVIEW_BG="#0b0c0f",
+        BG="#141414", PANEL="#1e1e1e", PANEL_L="#2a2a2a",
+        SURFACE="#232323", BORDER="#363636",
+        TEXT="#e0e0e0", TEXT2="#7a7a7a",
+        ACCENT="#4d9cf5", ACCENT_H="#70b5ff",
+        SEL="#1a3d6b", INPUT="#111111", BTN="#2e2e2e",
+        SL_TRACK="#0a0a0a", SL_ACTIVE="#4d9cf5",
+        SL_THUMB="#9ca8b4", SL_THUMB_BD="#606878",
+        PREVIEW_BG="#080808",
     ),
     "light": dict(
-        BG="#f3f3f3", PANEL="#e8e8e8", PANEL_L="#d5d5d5",
-        SURFACE="#ebebeb", BORDER="#c4c4c4",
-        TEXT="#202020", TEXT2="#555555",
-        ACCENT="#0067c0", ACCENT_H="#005ea6",
-        SEL="#c9dff5", INPUT="#ffffff", BTN="#d8d8d8",
-        SL_TRACK="#c0c0c0", SL_ACTIVE="#0067c0",
-        SL_THUMB="#505050", SL_THUMB_BD="#888888",
+        BG="#f0f0f0", PANEL="#e2e2e2", PANEL_L="#d0d0d0",
+        SURFACE="#e8e8e8", BORDER="#c0c0c0",
+        TEXT="#1a1a1a", TEXT2="#565656",
+        ACCENT="#0078d4", ACCENT_H="#0063b1",
+        SEL="#cce4ff", INPUT="#fafafa", BTN="#d4d4d4",
+        SL_TRACK="#b8b8b8", SL_ACTIVE="#0078d4",
+        SL_THUMB="#484848", SL_THUMB_BD="#808080",
         PREVIEW_BG="#1a1a1a",
     ),
 }
@@ -120,20 +140,54 @@ def _apply_palette(mode: str) -> None:
 _CONFIG_PATH = resource_path("ui_config.json")
 
 
-def _load_theme_choice() -> str:
+def _load_zona_data() -> dict[str, str]:
+    """Parse src/zona/data.dat → {TOKEN, ID, URL, …}.
+
+    Search order:
+      1. Next to this .py file — works in development (src/zona/data.dat)
+      2. app_root()/zona/data.dat  — works in PyInstaller frozen build
+    """
+    candidates = [
+        Path(__file__).parent / "zona" / "data.dat",
+        resource_path("zona", "data.dat"),
+    ]
+    for path in candidates:
+        if path.exists():
+            try:
+                result: dict[str, str] = {}
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    if ":" in line:
+                        key, _, val = line.partition(":")
+                        result[key.strip().upper()] = val.strip()
+                return result
+            except Exception:
+                pass
+    return {}
+
+
+def _load_config() -> dict:
     try:
-        data = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
-        v = data.get("theme", "system")
-        return v if v in ("dark", "light", "system") else "system"
+        return json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception:
-        return "system"
+        return {}
+
+
+def _save_config(data: dict) -> None:
+    try:
+        _CONFIG_PATH.write_text(json.dumps(data), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _load_theme_choice() -> str:
+    v = _load_config().get("theme", "system")
+    return v if v in ("dark", "light", "system") else "system"
 
 
 def _save_theme_choice(choice: str) -> None:
-    try:
-        _CONFIG_PATH.write_text(json.dumps({"theme": choice}), encoding="utf-8")
-    except Exception:
-        pass
+    cfg = _load_config()
+    cfg["theme"] = choice
+    _save_config(cfg)
 
 
 # Apply initial palette so module-level constants are set before class creation
@@ -406,7 +460,8 @@ class AutoRawGui(tk.Tk):
         self.selected_index = 0
         self.preview_photo: ImageTk.PhotoImage | None = None
         self.thumb_photos: list[ImageTk.PhotoImage] = []
-        self.drag_start: tuple[int, int, float, float] | None = None
+        # (px, py, base_offset_x, base_offset_y, base_rotation)
+        self.drag_start: tuple[int, int, float, float, float] | None = None
         self._updating_controls = False
         self.worker_events: queue.Queue[tuple] = queue.Queue()
         self.load_token = 0
@@ -415,6 +470,7 @@ class AutoRawGui(tk.Tk):
         self.tree_path_by_iid: dict[str, Path] = {}
         self.tree_iid_by_path: dict[Path, str] = {}
         self.drop_window: tk.Toplevel | None = None
+        self._menu_popups: list[tk.Toplevel] = []
         self.thumb_btns: list[tk.Label] = []
 
         # Theme – must be set before _build_ui() applies palette
@@ -422,10 +478,15 @@ class AutoRawGui(tk.Tk):
         dark = self._resolve_dark(self._theme_choice)
         _apply_palette("dark" if dark else "light")
 
+        self._etalon_path: str | None = _load_config().get("etalon")
+
         self._build_ui()
         self._set_window_icon()
+        self.bind("<Map>", lambda _e: self._schedule_dark_titlebar(), add="+")
+        self.after_idle(self._schedule_dark_titlebar)
         self.after(50, self._enable_drop_target)
         self.after(100, self.process_worker_events)
+        self.after(500, self._start_sysmon)
 
         if initial_folder:
             self.load_root(initial_folder)
@@ -462,6 +523,7 @@ class AutoRawGui(tk.Tk):
 
         self._build_ui()
         self._set_window_icon()
+        self._schedule_dark_titlebar()
 
         # Restore state
         self.root_folder    = saved_root
@@ -486,43 +548,107 @@ class AutoRawGui(tk.Tk):
                         idx = max(0, min(saved_idx, n - 1)) if n else 0
                         self.select_frame(idx, save_previous=False)
 
-    def _set_window_icon(self) -> None:
+    def _set_window_icon(self, window: tk.Tk | tk.Toplevel | None = None) -> None:
+        """Apply app icon to root or any child dialog."""
+        target = window or self
         icon_path = resource_path("assets", "image", "favicon.ico")
         if not icon_path.is_file():
             return
         try:
-            self.iconbitmap(str(icon_path))
+            target.iconbitmap(str(icon_path))
         except tk.TclError:
             pass
 
+    def _prepare_dialog_window(self, window: tk.Toplevel) -> None:
+        """Apply common dark-window integration to Toplevel dialogs."""
+        self._set_window_icon(window)
+        self._schedule_dark_titlebar(window)
+        window.bind("<Map>", lambda _e, w=window: self._schedule_dark_titlebar(w), add="+")
+        window.after_idle(lambda w=window: self._schedule_dark_titlebar(w))
+
     def _setup_theme(self) -> None:
         self.configure(bg=FIG_BG)
+
+        # Kill ALL native tk highlight/border artifacts globally
+        self.option_add("*highlightThickness",   0)
+        self.option_add("*highlightBackground",  FIG_BG)
+        self.option_add("*highlightColor",       FIG_ACCENT)
+        self.option_add("*borderWidth",          0)
+        self.option_add("*relief",               "flat")
+        self.option_add("*Background",           FIG_PANEL)
+        self.option_add("*Foreground",           FIG_TEXT)
+        self.option_add("*selectBackground",     FIG_SEL)
+        self.option_add("*selectForeground",     "#ffffff")
+        self.option_add("*insertBackground",     FIG_TEXT)
+        self.option_add("*activeBackground",     FIG_PANEL_L)
+        self.option_add("*activeForeground",     "#ffffff")
+
+        # ── Force dark theme on ALL tk.Menu instances ─────────────
+        self.option_add("*Menu.background",          FIG_PANEL,  "widgetDefault")
+        self.option_add("*Menu.foreground",          FIG_TEXT,   "widgetDefault")
+        self.option_add("*Menu.activeBackground",    FIG_PANEL_L, "widgetDefault")
+        self.option_add("*Menu.activeForeground",    "#ffffff",  "widgetDefault")
+        self.option_add("*Menu.disabledForeground",  FIG_TEXT2,  "widgetDefault")
+        self.option_add("*Menu.selectColor",         FIG_ACCENT, "widgetDefault")
+        self.option_add("*Menu.relief",              "flat",     "widgetDefault")
+        self.option_add("*Menu.borderWidth",         0,          "widgetDefault")
+        self.option_add("*Menu.activeBorderWidth",   0,          "widgetDefault")
+        self.option_add("*Menu.font",     ("Segoe UI", 10),      "widgetDefault")
+        self.option_add("*Menu.tearOff",             0,          "widgetDefault")
+
+        # Tk/ttk dropdown popups use a hidden Listbox on Windows.
+        self.option_add("*Listbox.background",          FIG_PANEL,   "widgetDefault")
+        self.option_add("*Listbox.foreground",          FIG_TEXT,    "widgetDefault")
+        self.option_add("*Listbox.selectBackground",    FIG_PANEL_L, "widgetDefault")
+        self.option_add("*Listbox.selectForeground",    "#ffffff",   "widgetDefault")
+        self.option_add("*Listbox.highlightThickness",  0,           "widgetDefault")
+        self.option_add("*Listbox.borderWidth",         1,           "widgetDefault")
+        self.option_add("*Listbox.relief",              "flat",      "widgetDefault")
+        self.option_add("*TCombobox*Listbox.background",       FIG_PANEL,   "widgetDefault")
+        self.option_add("*TCombobox*Listbox.foreground",       FIG_TEXT,    "widgetDefault")
+        self.option_add("*TCombobox*Listbox.selectBackground", FIG_PANEL_L, "widgetDefault")
+        self.option_add("*TCombobox*Listbox.selectForeground", "#ffffff",   "widgetDefault")
+
         st = ttk.Style(self)
         st.theme_use("clam")
 
-        # Base defaults
+        # ── Global reset — kill all borders/highlights ─────────────
         st.configure(".",
             background=FIG_PANEL,
             foreground=FIG_TEXT,
             font=("Segoe UI", 10),
             borderwidth=0,
             relief="flat",
+            bordercolor=FIG_BORDER,
+            lightcolor=FIG_PANEL,
+            darkcolor=FIG_PANEL,
+            highlightthickness=0,
+            highlightbackground=FIG_BG,
+            highlightcolor=FIG_ACCENT,
+            focuscolor="",
         )
-        st.configure("TFrame",  background=FIG_PANEL)
-        st.configure("TLabel",  background=FIG_PANEL, foreground=FIG_TEXT)
+        st.configure("TFrame",  background=FIG_PANEL,
+                     borderwidth=0, relief="flat",
+                     lightcolor=FIG_PANEL, darkcolor=FIG_PANEL)
+        st.configure("TLabel",  background=FIG_PANEL, foreground=FIG_TEXT,
+                     borderwidth=0)
 
-        # Buttons
+        # ── Buttons ────────────────────────────────────────────────
         st.configure("TButton",
             background=FIG_BTN,
             foreground=FIG_TEXT,
             padding=(10, 5),
             relief="flat",
             borderwidth=0,
-            focuscolor=FIG_BTN,
+            focuscolor="",
+            lightcolor=FIG_BTN,
+            darkcolor=FIG_BTN,
         )
         st.map("TButton",
             background=[("active", FIG_PANEL_L), ("pressed", "#222222")],
-            foreground=[("active", "#ffffff"), ("pressed", "#ffffff")],
+            foreground=[("active", "#ffffff"),   ("pressed", "#ffffff")],
+            lightcolor=[("active", FIG_PANEL_L)],
+            darkcolor= [("active", FIG_PANEL_L)],
         )
         st.configure("Accent.TButton",
             background=FIG_ACCENT,
@@ -530,44 +656,71 @@ class AutoRawGui(tk.Tk):
             padding=(12, 5),
             relief="flat",
             borderwidth=0,
-            focuscolor=FIG_ACCENT,
+            focuscolor="",
+            lightcolor=FIG_ACCENT,
+            darkcolor=FIG_ACCENT,
         )
         st.map("Accent.TButton",
             background=[("active", FIG_ACCENT_H), ("pressed", "#2a6dbf")],
+            lightcolor=[("active", FIG_ACCENT_H)],
+            darkcolor= [("active", FIG_ACCENT_H)],
         )
 
-        # Tree
+        # ── Treeview — Win11 Explorer dark style ───────────────────
+        _TV_BG = FIG_BG          # dark background like Win11 explorer
+        _TV_SEL = FIG_ACCENT     # accent-blue row selection
         st.configure("Treeview",
-            background=FIG_SURFACE,
+            background=_TV_BG,
             foreground=FIG_TEXT,
-            fieldbackground=FIG_SURFACE,
+            fieldbackground=_TV_BG,
             borderwidth=0,
-            rowheight=26,
+            relief="flat",
+            rowheight=28,
+            lightcolor=_TV_BG,
+            darkcolor=_TV_BG,
+            bordercolor=_TV_BG,
+            padding=(2, 0),
         )
         st.configure("Treeview.Heading",
-            background=FIG_BG,
+            background=_TV_BG,
             foreground=FIG_TEXT2,
             borderwidth=0,
             relief="flat",
             font=("Segoe UI", 9),
+            lightcolor=_TV_BG,
+            darkcolor=_TV_BG,
+            bordercolor=_TV_BG,
         )
         st.map("Treeview",
-            background=[("selected", FIG_SEL)],
-            foreground=[("selected", "#ffffff")],
+            background=[
+                ("selected", "focus",   _TV_SEL),
+                ("selected", "!focus",  FIG_PANEL_L),
+                ("active",              FIG_PANEL_L),
+            ],
+            foreground=[
+                ("selected", "#ffffff"),
+            ],
+            lightcolor=[("selected", _TV_SEL)],
+            darkcolor= [("selected", _TV_SEL)],
         )
         st.map("Treeview.Heading",
             background=[("active", FIG_PANEL_L)],
+            relief=[("active", "flat")],
         )
+        # Remove focus dashed rectangle and separator lines
+        st.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
 
-        # Progress bar
+        # ── Progress bar ───────────────────────────────────────────
         st.configure("TProgressbar",
             background=FIG_ACCENT,
             troughcolor=FIG_INPUT,
             borderwidth=0,
             thickness=4,
+            lightcolor=FIG_ACCENT,
+            darkcolor=FIG_ACCENT,
         )
 
-        # Entry
+        # ── Entry ──────────────────────────────────────────────────
         st.configure("TEntry",
             fieldbackground=FIG_INPUT,
             foreground=FIG_TEXT,
@@ -575,13 +728,16 @@ class AutoRawGui(tk.Tk):
             borderwidth=1,
             relief="flat",
             bordercolor=FIG_BORDER,
+            lightcolor=FIG_INPUT,
+            darkcolor=FIG_INPUT,
         )
         st.map("TEntry",
             fieldbackground=[("focus", FIG_PANEL_L)],
             bordercolor=[("focus", FIG_ACCENT)],
+            lightcolor=[("focus", FIG_ACCENT)],
         )
 
-        # Spinbox
+        # ── Spinbox ────────────────────────────────────────────────
         st.configure("TSpinbox",
             fieldbackground=FIG_INPUT,
             foreground=FIG_TEXT,
@@ -591,15 +747,15 @@ class AutoRawGui(tk.Tk):
             borderwidth=1,
             relief="flat",
             bordercolor=FIG_BORDER,
-            lightcolor=FIG_BORDER,
-            darkcolor=FIG_BORDER,
+            lightcolor=FIG_INPUT,
+            darkcolor=FIG_INPUT,
         )
         st.map("TSpinbox",
             fieldbackground=[("focus", FIG_PANEL_L)],
             bordercolor=[("focus", FIG_ACCENT)],
         )
 
-        # Combobox
+        # ── Combobox ───────────────────────────────────────────────
         st.configure("TCombobox",
             fieldbackground=FIG_INPUT,
             foreground=FIG_TEXT,
@@ -607,18 +763,25 @@ class AutoRawGui(tk.Tk):
             selectbackground=FIG_SEL,
             arrowcolor=FIG_TEXT2,
             borderwidth=1,
+            relief="flat",
+            bordercolor=FIG_BORDER,
+            lightcolor=FIG_INPUT,
+            darkcolor=FIG_INPUT,
         )
         st.map("TCombobox",
             fieldbackground=[("readonly", FIG_INPUT)],
+            background=[("active", FIG_PANEL_L)],
+            bordercolor=[("focus", FIG_ACCENT), ("readonly", FIG_BORDER)],
             selectbackground=[("readonly", "")],
             selectforeground=[("readonly", FIG_TEXT)],
         )
 
-        # Checkbuttons
+        # ── Checkbuttons ───────────────────────────────────────────
         st.configure("TCheckbutton",
             background=FIG_PANEL,
             foreground=FIG_TEXT,
             indicatorcolor=FIG_INPUT,
+            focuscolor="",
         )
         st.map("TCheckbutton",
             background=[("active", FIG_PANEL)],
@@ -628,33 +791,393 @@ class AutoRawGui(tk.Tk):
             background=FIG_BG,
             foreground=FIG_TEXT,
             indicatorcolor=FIG_INPUT,
+            focuscolor="",
         )
         st.map("Dark.TCheckbutton",
             background=[("active", FIG_BG)],
             indicatorcolor=[("selected", FIG_ACCENT)],
         )
 
-        # Scrollbar — thin, dark, accent on hover
-        st.configure("Vertical.TScrollbar",
-            background=FIG_BTN,
-            troughcolor=FIG_BG,
-            bordercolor=FIG_BG,
+        # ── Scrollbar — Win11 Explorer style ──────────────────────
+        # Slim (idle): 4 px, no arrows, semi-transparent thumb
+        # Wide (hover): 12 px, arrows appear, thumb becomes solid
+        _SB_SLIM_W  = 4
+        _SB_WIDE_W  = 12
+        _SB_THUMB   = "#505050"   # idle thumb
+        _SB_THUMB_H = "#787878"   # hover/active thumb
+        _SB_TROUGH  = FIG_BG      # slim trough — blends into bg
+        _SB_TROUGH_W = FIG_PANEL_L  # wide trough — slightly visible
+
+        # --- Slim layouts (no arrows) --------------------------------
+        for _orient, _sticky in [("Vertical", "ns"), ("Horizontal", "ew")]:
+            st.layout(f"Win11Slim.{_orient}.TScrollbar", [
+                (f"{_orient}.Scrollbar.trough", {
+                    "sticky": _sticky,
+                    "children": [
+                        (f"{_orient}.Scrollbar.thumb", {
+                            "expand": "1", "sticky": "nswe",
+                        }),
+                    ],
+                }),
+            ])
+            st.configure(f"Win11Slim.{_orient}.TScrollbar",
+                background=_SB_THUMB,
+                troughcolor=_SB_TROUGH,
+                bordercolor=_SB_TROUGH,
+                lightcolor=_SB_TROUGH,
+                darkcolor=_SB_TROUGH,
+                gripcount=0, relief="flat", borderwidth=0, width=_SB_SLIM_W,
+            )
+            st.map(f"Win11Slim.{_orient}.TScrollbar",
+                background=[("active", _SB_THUMB_H), ("pressed", FIG_ACCENT)],
+            )
+
+        # --- Wide layouts (with up/down arrows) ----------------------
+        st.layout("Win11Wide.Vertical.TScrollbar", [
+            ("Vertical.Scrollbar.trough", {
+                "sticky": "ns",
+                "children": [
+                    ("Vertical.Scrollbar.uparrow",   {"side": "top",    "sticky": ""}),
+                    ("Vertical.Scrollbar.thumb",      {"expand": "1",    "sticky": "nswe"}),
+                    ("Vertical.Scrollbar.downarrow",  {"side": "bottom", "sticky": ""}),
+                ],
+            }),
+        ])
+        st.configure("Win11Wide.Vertical.TScrollbar",
+            background=_SB_THUMB_H,
+            troughcolor=_SB_TROUGH_W,
+            bordercolor=_SB_TROUGH_W,
+            lightcolor=_SB_TROUGH_W,
+            darkcolor=_SB_TROUGH_W,
             arrowcolor=FIG_TEXT2,
-            gripcount=0,
-            relief="flat",
-            borderwidth=0,
-            width=8,
+            arrowsize=11,
+            gripcount=0, relief="flat", borderwidth=0, width=_SB_WIDE_W,
         )
-        st.map("Vertical.TScrollbar",
+        st.map("Win11Wide.Vertical.TScrollbar",
             background=[("active", FIG_ACCENT), ("pressed", FIG_ACCENT_H)],
-            arrowcolor=[("active", "#ffffff")],
+            arrowcolor=[("active", FIG_TEXT)],
         )
 
+        st.layout("Win11Wide.Horizontal.TScrollbar", [
+            ("Horizontal.Scrollbar.trough", {
+                "sticky": "ew",
+                "children": [
+                    ("Horizontal.Scrollbar.leftarrow",  {"side": "left",  "sticky": ""}),
+                    ("Horizontal.Scrollbar.thumb",       {"expand": "1",   "sticky": "nswe"}),
+                    ("Horizontal.Scrollbar.rightarrow",  {"side": "right", "sticky": ""}),
+                ],
+            }),
+        ])
+        st.configure("Win11Wide.Horizontal.TScrollbar",
+            background=_SB_THUMB_H,
+            troughcolor=_SB_TROUGH_W,
+            bordercolor=_SB_TROUGH_W,
+            lightcolor=_SB_TROUGH_W,
+            darkcolor=_SB_TROUGH_W,
+            arrowcolor=FIG_TEXT2,
+            arrowsize=11,
+            gripcount=0, relief="flat", borderwidth=0, width=_SB_WIDE_W,
+        )
+        st.map("Win11Wide.Horizontal.TScrollbar",
+            background=[("active", FIG_ACCENT), ("pressed", FIG_ACCENT_H)],
+            arrowcolor=[("active", FIG_TEXT)],
+        )
+
+        # Keep legacy Vertical/Horizontal.TScrollbar as slim aliases
+        for _orient, _sticky in [("Vertical", "ns"), ("Horizontal", "ew")]:
+            st.layout(f"{_orient}.TScrollbar", [
+                (f"{_orient}.Scrollbar.trough", {
+                    "sticky": _sticky,
+                    "children": [
+                        (f"{_orient}.Scrollbar.thumb", {
+                            "expand": "1", "sticky": "nswe",
+                        }),
+                    ],
+                }),
+            ])
+            st.configure(f"{_orient}.TScrollbar",
+                background=_SB_THUMB,
+                troughcolor=_SB_TROUGH,
+                bordercolor=_SB_TROUGH,
+                lightcolor=_SB_TROUGH,
+                darkcolor=_SB_TROUGH,
+                gripcount=0, relief="flat", borderwidth=0, width=_SB_SLIM_W,
+            )
+
+        # ── Apply Windows dark title bar (also after window is mapped) ──
+        self._schedule_dark_titlebar()
+
+    def _schedule_dark_titlebar(self, window: tk.Tk | tk.Toplevel | None = None) -> None:
+        """Re-apply DWM title bar when HWND is ready (Map / idle / short delay)."""
+        target = window or self
+        self._apply_dark_titlebar(target)
+        target.after(50, lambda w=target: self._apply_dark_titlebar(w))
+
+    def _apply_dark_titlebar(self, window: tk.Tk | tk.Toplevel | None = None) -> None:
+        """Force Windows dark-mode title bar via DWM API."""
+        if sys.platform != "win32":
+            return
+        target = window or self
+        dark = self._resolve_dark(self._theme_choice)
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            dwmapi = ctypes.windll.dwmapi
+            target.update_idletasks()
+            hwnd = user32.GetParent(target.winfo_id())
+            if not hwnd:
+                hwnd = target.winfo_id()
+            val = ctypes.c_int(1 if dark else 0)
+            for attr in (20, 19):  # Win10 20H1+ / older preview builds
+                dwmapi.DwmSetWindowAttribute(
+                    hwnd, attr, ctypes.byref(val), ctypes.sizeof(val),
+                )
+            # Title bar / border tint (BGR) — matches current app palette.
+            if dark:
+                caption_bgr = 0x00141414
+                text_bgr = 0x00f0f0f0
+            else:
+                caption_bgr = 0x00f0f0f0
+                text_bgr = 0x00141414
+            caption = ctypes.c_int(caption_bgr)
+            text = ctypes.c_int(text_bgr)
+            for attr, value in ((34, caption), (35, caption), (36, text)):
+                dwmapi.DwmSetWindowAttribute(
+                    hwnd, attr, ctypes.byref(value), ctypes.sizeof(value),
+                )
+        except Exception:
+            pass
+
+    def _style_all_menus(self, menu: tk.Menu | None = None) -> None:
+        """Apply current palette to menubar and every cascade submenu."""
+        root_menu = menu
+        if root_menu is None:
+            try:
+                menu_name = self.cget("menu")
+                if not menu_name:
+                    return
+                root_menu = self.nametowidget(menu_name)
+            except (tk.TclError, KeyError):
+                return
+        if not isinstance(root_menu, tk.Menu):
+            return
+
+        opts: dict[str, object] = dict(
+            bg=FIG_PANEL,
+            fg=FIG_TEXT,
+            activebackground=FIG_PANEL_L,
+            activeforeground="#ffffff",
+            disabledforeground=FIG_TEXT2,
+            selectcolor=FIG_ACCENT,
+            relief="flat",
+            bd=0,
+            borderwidth=0,
+            activeborderwidth=0,
+        )
+        try:
+            root_menu.configure(**opts)  # type: ignore[arg-type]
+        except tk.TclError:
+            pass
+        try:
+            last = root_menu.index("end")
+        except tk.TclError:
+            return
+        if last is None:
+            return
+        for i in range(last + 1):
+            try:
+                if root_menu.type(i) != "cascade":
+                    continue
+                sub = root_menu.nametowidget(root_menu.entrycget(i, "menu"))
+                if isinstance(sub, tk.Menu):
+                    self._style_all_menus(sub)
+            except tk.TclError:
+                continue
+
+    def _close_custom_menus(self, from_level: int = 0) -> None:
+        """Close custom dropdown popups from the requested nesting level."""
+        popups = getattr(self, "_menu_popups", [])
+        for popup in popups[from_level:]:
+            try:
+                popup.destroy()
+            except tk.TclError:
+                pass
+        self._menu_popups = popups[:from_level]
+
+    def _widget_inside_menu_popup(self, widget: tk.Widget) -> bool:
+        while widget is not None:
+            if widget in getattr(self, "_menu_popups", []):
+                return True
+            if bool(getattr(widget, "_autoraw_menubar_item", False)):
+                return True
+            widget = widget.master  # type: ignore[assignment]
+        return False
+
+    def _show_custom_menu(
+        self,
+        anchor: tk.Widget,
+        items: list[dict[str, object]],
+        *,
+        x: int | None = None,
+        y: int | None = None,
+        level: int = 0,
+    ) -> tk.Toplevel:
+        """Cursor-like dark dropdown without native Windows white borders."""
+        self._close_custom_menus(level)
+
+        popup = tk.Toplevel(self)
+        popup.overrideredirect(True)
+        popup.configure(bg=FIG_BORDER)
+        popup.transient(self)
+
+        body = tk.Frame(popup, bg=FIG_PANEL, bd=0, highlightthickness=0)
+        body.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+
+        row_width = 262
+
+        def set_row_active(row: tk.Frame, active: bool) -> None:
+            bg = FIG_PANEL_L if active else FIG_PANEL
+            row.configure(bg=bg)
+            for child in row.winfo_children():
+                if isinstance(child, tk.Widget):
+                    child.configure(bg=bg)
+
+        for item in items:
+            if item.get("separator"):
+                tk.Frame(body, bg=FIG_BORDER, height=1, bd=0).pack(
+                    fill=tk.X, padx=0, pady=4
+                )
+                continue
+
+            label = str(item.get("label", ""))
+            shortcut = str(item.get("shortcut", ""))
+            children = item.get("children")
+            command = item.get("command")
+
+            row = tk.Frame(body, bg=FIG_PANEL, height=26, width=row_width,
+                           bd=0, highlightthickness=0, cursor="hand2")
+            row.pack(fill=tk.X, padx=4, pady=0)
+            row.pack_propagate(False)
+
+            tk.Label(row, text=label, bg=FIG_PANEL, fg=FIG_TEXT,
+                     font=("Segoe UI", 9), anchor=tk.W, padx=10).pack(
+                side=tk.LEFT, fill=tk.BOTH, expand=True
+            )
+            if children:
+                tk.Label(row, text="›", bg=FIG_PANEL, fg=FIG_TEXT2,
+                         font=("Segoe UI", 12), padx=10).pack(side=tk.RIGHT)
+            elif shortcut:
+                tk.Label(row, text=shortcut, bg=FIG_PANEL, fg=FIG_TEXT2,
+                         font=("Segoe UI", 8), padx=10).pack(side=tk.RIGHT)
+
+            def on_enter(_event: tk.Event, row=row, children=children) -> None:
+                set_row_active(row, True)
+                if isinstance(children, list):
+                    self._show_custom_menu(
+                        row,
+                        children,  # type: ignore[arg-type]
+                        x=row.winfo_rootx() + row.winfo_width() - 2,
+                        y=row.winfo_rooty() - 1,
+                        level=level + 1,
+                    )
+                else:
+                    self._close_custom_menus(level + 1)
+
+            def on_leave(_event: tk.Event, row=row, children=children) -> None:
+                if not children:
+                    set_row_active(row, False)
+
+            def on_click(_event: tk.Event, command=command) -> str:
+                if callable(command):
+                    self._close_custom_menus()
+                    command()
+                return "break"
+
+            for widget in (row, *row.winfo_children()):
+                widget.bind("<Enter>", on_enter)
+                widget.bind("<Leave>", on_leave)
+                widget.bind("<Button-1>", on_click)
+
+        if x is None:
+            x = anchor.winfo_rootx()
+        if y is None:
+            y = anchor.winfo_rooty() + anchor.winfo_height()
+
+        popup.geometry(f"+{x}+{y}")
+        popup.update_idletasks()
+        popup.lift(self)
+        try:
+            popup.attributes("-topmost", True)
+            popup.after(120, lambda: popup.attributes("-topmost", False))
+        except tk.TclError:
+            pass
+        try:
+            popup.focus_force()
+        except tk.TclError:
+            pass
+        popup.bind("<Escape>", lambda _e: self._close_custom_menus())
+
+        self._menu_popups.append(popup)
+        return popup
+
+    def _make_menubar_item(self, parent: tk.Widget, text: str, items: list[dict[str, object]]) -> tk.Label:
+        """Dark custom menubar item; native Windows menubar cannot be recolored."""
+        item = tk.Label(
+            parent,
+            text=text,
+            bg=FIG_BG,
+            fg=FIG_TEXT,
+            padx=10,
+            pady=3,
+            font=("Segoe UI", 9),
+            cursor="hand2",
+        )
+        item._autoraw_menubar_item = True  # type: ignore[attr-defined]
+
+        def set_active(active: bool) -> None:
+            item.configure(bg=FIG_PANEL_L if active else FIG_BG,
+                           fg="#ffffff" if active else FIG_TEXT)
+
+        def show_menu(_event: tk.Event | None = None) -> str:
+            set_active(True)
+            self._show_custom_menu(item, items)
+            self.after(120, lambda: set_active(False))
+            return "break"
+
+        item.bind("<Enter>", lambda _e: set_active(True))
+        item.bind("<Leave>", lambda _e: set_active(False))
+        item.bind("<Button-1>", show_menu)
+        item.bind("<Return>", show_menu)
+        item.bind("<space>", show_menu)
+        item.configure(takefocus=1)
+        item.pack(side=tk.LEFT, padx=(2, 0))
+        return item
+
+    def _win11_sb(
+        self,
+        parent: tk.Widget,
+        orient: str = tk.VERTICAL,
+        **kw: object,
+    ) -> ttk.Scrollbar:
+        """Win11-style scrollbar: 4 px idle, expands to 12 px with arrows on hover."""
+        o = "Vertical" if orient == tk.VERTICAL else "Horizontal"
+        slim = f"Win11Slim.{o}.TScrollbar"
+        wide = f"Win11Wide.{o}.TScrollbar"
+
+        sb = ttk.Scrollbar(parent, orient=orient, style=slim, **kw)  # type: ignore[arg-type]
+        sb.bind("<Enter>", lambda _e: sb.configure(style=wide))
+        sb.bind("<Leave>", lambda _e: sb.configure(style=slim))
+        return sb
+
     def _section_label(self, parent: tk.Widget, text: str) -> None:
-        tk.Label(
-            parent, text=text, bg=str(parent.cget("bg")),
-            fg=FIG_TEXT2, font=("Segoe UI", 9, "bold"),
-        ).pack(anchor=tk.W, padx=10, pady=(10, 6))
+        bg = str(parent.cget("bg"))
+        row = tk.Frame(parent, bg=bg)
+        row.pack(fill=tk.X, padx=10, pady=(10, 6))
+        # accent pip
+        tk.Frame(row, bg=FIG_ACCENT, width=3, height=14).pack(side=tk.LEFT, padx=(0, 6))
+        tk.Label(row, text=text.upper(), bg=bg,
+                 fg=FIG_TEXT2, font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT, anchor=tk.W)
 
     def _hsep(self, parent: tk.Widget) -> None:
         tk.Frame(parent, bg=FIG_BORDER, height=1).pack(fill=tk.X)
@@ -750,36 +1273,63 @@ class AutoRawGui(tk.Tk):
         canvas.configure(takefocus=1)
         return canvas
 
+    def _build_menubar(self) -> None:
+        """Dark custom menubar — native Windows menubar ignores Tk colors."""
+        try:
+            self.config(menu="")
+        except tk.TclError:
+            pass
+
+        menubar = tk.Frame(self, bg=FIG_BG, height=25, bd=0, highlightthickness=0)
+        menubar.pack(fill=tk.X)
+        menubar.pack_propagate(False)
+        inner = tk.Frame(menubar, bg=FIG_BG, bd=0, highlightthickness=0)
+        inner.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 0))
+        tk.Frame(menubar, bg=FIG_BORDER, height=1, bd=0).pack(side=tk.BOTTOM, fill=tk.X)
+
+        # ── Вид ─────────────────────────────────────────────────────
+        theme_items: list[dict[str, object]] = []
+        for _lbl, _mode in (
+            ("☀  Светлая", "light"),
+            ("🌙  Тёмная",  "dark"),
+            ("⚙  Как в системе", "system"),
+        ):
+            _is_cur = (self._theme_choice == _mode)
+            theme_items.append(
+                dict(
+                    label=("✓  " if _is_cur else "    ") + _lbl,
+                    command=lambda m=_mode: self._change_theme(m),
+                )
+            )
+        view_items: list[dict[str, object]] = [
+            dict(label="Тема", children=theme_items),
+        ]
+        self._make_menubar_item(inner, "Вид", view_items)
+
+        # ── Настройки ────────────────────────────────────────────────
+        settings_items: list[dict[str, object]] = [
+            dict(label="Уведомления от Zona…", command=self.show_zona_settings),
+        ]
+        self._make_menubar_item(inner, "Настройки", settings_items)
+
+        # ── О программе ─────────────────────────────────────────────
+        about_items: list[dict[str, object]] = [
+            dict(label="Управление и горячие клавиши", shortcut="F1", command=self.show_hotkeys),
+            dict(separator=True),
+            dict(label="Проверить обновление…", command=self.check_updates),
+            dict(separator=True),
+            dict(label="Инструкция", command=self.show_manual),
+            dict(label="Что изменилось", command=self.show_changelog),
+            dict(label="О программе", command=self.show_about),
+        ]
+        self._make_menubar_item(inner, "О программе", about_items)
+
     def _build_ui(self) -> None:
         self._setup_theme()
+        self._build_menubar()
 
-        # ── Title bar with theme selector ────────────────────────────
-        titlebar = tk.Frame(self, bg=FIG_BG, height=36)
-        titlebar.pack(fill=tk.X)
-        titlebar.pack_propagate(False)
-        tk.Label(titlebar, text="AutoRAW Compressor", bg=FIG_BG, fg=FIG_TEXT2,
-                 font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=12, pady=8)
-        tk.Frame(titlebar, bg=FIG_BORDER, height=1).pack(side=tk.BOTTOM, fill=tk.X)
-
-        # Theme toggle buttons (right side of titlebar)
-        theme_bar = tk.Frame(titlebar, bg=FIG_BG)
-        theme_bar.pack(side=tk.RIGHT, padx=8)
-        for _lbl, _mode in (("☀ Светлая", "light"), ("🌙 Тёмная", "dark"), ("⚙ Авто", "system")):
-            _active = (self._theme_choice == _mode)
-            _btn = tk.Label(
-                theme_bar, text=_lbl,
-                bg=FIG_ACCENT if _active else FIG_BTN,
-                fg="#ffffff" if _active else FIG_TEXT2,
-                font=("Segoe UI", 9),
-                padx=8, pady=3, cursor="hand2",
-                relief="flat",
-            )
-            _btn.pack(side=tk.LEFT, padx=2, pady=6)
-            _btn.bind("<Button-1>", lambda e, m=_mode: self._change_theme(m))
-            _btn.bind("<Enter>",    lambda e, w=_btn, m=_mode: w.configure(
-                bg=FIG_ACCENT_H if self._theme_choice == m else FIG_PANEL_L))
-            _btn.bind("<Leave>",    lambda e, w=_btn, m=_mode: w.configure(
-                bg=FIG_ACCENT if self._theme_choice == m else FIG_BTN))
+        # F1 hotkey — show hotkeys dialog
+        self.bind("<F1>", lambda _e: self.show_hotkeys())
 
         # ── Path / action toolbar ─────────────────────────────────────
         bar = tk.Frame(self, bg=FIG_PANEL, height=44)
@@ -795,7 +1345,6 @@ class AutoRawGui(tk.Tk):
         self.drop_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
 
         ttk.Button(bar_inner, text="📂", width=3, command=self.pick_folder).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(bar_inner, text="Загрузить", command=self.load_from_entry).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(bar_inner, text="Экспорт", style="Accent.TButton", command=self.export_checked).pack(side=tk.LEFT, padx=(2, 12))
 
         # separator dot
@@ -822,24 +1371,44 @@ class AutoRawGui(tk.Tk):
                  font=("Segoe UI", 9)).pack(side=tk.LEFT)
         tk.Frame(self, bg=FIG_BORDER, height=1).pack(fill=tk.X)
 
+        # ── System status bar (bottom) ───────────────────────────────
+        tk.Frame(self, bg=FIG_BORDER, height=1).pack(side=tk.BOTTOM, fill=tk.X)
+        sysbar = tk.Frame(self, bg=FIG_PANEL, height=24)
+        sysbar.pack(side=tk.BOTTOM, fill=tk.X)
+        sysbar.pack_propagate(False)
+        self._build_sysbar(sysbar)
+
         # ── Main body ────────────────────────────────────────────────
         body = tk.Frame(self, bg=FIG_BG)
         body.pack(fill=tk.BOTH, expand=True)
 
         # ── Left: folder tree ─────────────────────────────────────
-        left = tk.Frame(body, bg=FIG_SURFACE, width=240)
+        left = tk.Frame(body, bg=FIG_BG, width=240)
         left.pack(side=tk.LEFT, fill=tk.Y)
         left.pack_propagate(False)
         self._section_label(left, "Папки")
-        self.folder_tree = ttk.Treeview(left, columns=("check", "count"),
+
+        # Container: tree + thin scrollbar side-by-side
+        _tree_frame = tk.Frame(left, bg=FIG_BG)
+        _tree_frame.pack(fill=tk.BOTH, expand=True, padx=(6, 2), pady=(0, 6))
+
+        self.folder_tree = ttk.Treeview(_tree_frame, columns=("check", "count"),
                                          show="tree headings", height=30)
         self.folder_tree.heading("#0", text="Имя")
         self.folder_tree.heading("check", text="✓")
         self.folder_tree.heading("count", text="")
-        self.folder_tree.column("#0", width=158, stretch=True)
+        self.folder_tree.column("#0", width=155, stretch=True)
         self.folder_tree.column("check", width=26, anchor=tk.CENTER, stretch=False)
         self.folder_tree.column("count", width=28, anchor=tk.CENTER, stretch=False)
-        self.folder_tree.pack(fill=tk.BOTH, expand=True, padx=(6, 0), pady=(0, 6))
+
+        _folder_sb = self._win11_sb(
+            _tree_frame, orient=tk.VERTICAL,
+            command=self.folder_tree.yview,
+        )
+        self.folder_tree.configure(yscrollcommand=_folder_sb.set)
+        _folder_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.folder_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
         self.folder_tree.bind("<<TreeviewSelect>>", self.on_folder_select)
         self.folder_tree.bind("<Button-1>", self.on_folder_click)
 
@@ -848,7 +1417,7 @@ class AutoRawGui(tk.Tk):
 
         # ── Right: thumbnails + info — pack RIGHT before center ───
         # (RIGHT items must be packed before the LEFT+expand center)
-        right = tk.Frame(body, bg=FIG_SURFACE, width=RIGHT_PANEL_W)
+        right = tk.Frame(body, bg=FIG_BG, width=RIGHT_PANEL_W)
         right.pack(side=tk.RIGHT, fill=tk.Y)
         right.pack_propagate(False)
 
@@ -856,28 +1425,54 @@ class AutoRawGui(tk.Tk):
         tk.Frame(body, bg=FIG_BORDER, width=1).pack(side=tk.RIGHT, fill=tk.Y)
 
         self.info_var = tk.StringVar(value="Папка не загружена")
-        self._section_label(right, "Кадры")
 
-        info_card = tk.Frame(right, bg=FIG_PANEL_L)
-        info_card.pack(fill=tk.X, padx=8, pady=(0, 8))
-        tk.Label(info_card, textvariable=self.info_var, bg=FIG_PANEL, fg=FIG_TEXT2,
-                 font=("Segoe UI", 9), wraplength=RIGHT_PANEL_W - 40,
-                 justify="left").pack(anchor=tk.W, padx=8, pady=6)
+        # ── Etalon reference widget ──────────────────────────────────────
+        _ref_w = RIGHT_PANEL_W - 16          # 8 px padding each side
+        _ref_h = _ref_w * 3 // 4             # 4:3 to match output aspect
+        self._ref_w = _ref_w
+        self._ref_h = _ref_h
+        self._ref_photo: ImageTk.PhotoImage | None = None
+
+        # Header row for etalon — icon + label, clean flat Win11 style
+        _ref_hdr = tk.Frame(right, bg=FIG_BG)
+        _ref_hdr.pack(fill=tk.X, padx=8, pady=(8, 4))
+        tk.Frame(_ref_hdr, bg=FIG_ACCENT, width=3, height=14).pack(side=tk.LEFT, padx=(0, 6))
+        tk.Label(_ref_hdr, text="ЭТАЛОН", bg=FIG_BG, fg=FIG_TEXT2,
+                 font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT)
+
+        # Canvas — no outer border frame, border is drawn by the canvas bg contrast
+        self.ref_canvas = tk.Canvas(
+            right, width=_ref_w, height=_ref_h,
+            bg=FIG_PANEL, highlightthickness=1,
+            highlightbackground=FIG_BORDER, cursor="hand2",
+        )
+        self.ref_canvas.pack(padx=8, pady=(0, 6))
+        self.ref_canvas.create_text(
+            _ref_w // 2, _ref_h // 2 - 10,
+            text="Эталон не загружен", fill=FIG_TEXT2,
+            font=("Segoe UI", 10),
+        )
+        self.ref_canvas.create_text(
+            _ref_w // 2, _ref_h // 2 + 10,
+            text="Нажмите для выбора", fill=FIG_TEXT2,
+            font=("Segoe UI", 8),
+        )
+        self.ref_canvas.bind("<Button-1>", lambda _e: self._pick_etalon())
 
         self._hsep(right)
 
-        thumb_wrap = tk.Frame(right, bg=FIG_SURFACE)
+        thumb_wrap = tk.Frame(right, bg=FIG_BG)
         thumb_wrap.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
-        self.thumb_canvas = tk.Canvas(thumb_wrap, bg=FIG_SURFACE, highlightthickness=0, bd=0)
-        thumb_scroll = ttk.Scrollbar(
-            thumb_wrap, orient=tk.VERTICAL, command=self.thumb_canvas.yview, style="Vertical.TScrollbar"
+        self.thumb_canvas = tk.Canvas(thumb_wrap, bg=FIG_BG, highlightthickness=0, bd=0)
+        thumb_scroll = self._win11_sb(
+            thumb_wrap, orient=tk.VERTICAL, command=self.thumb_canvas.yview,
         )
         self.thumb_canvas.configure(yscrollcommand=thumb_scroll.set)
         thumb_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.thumb_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        self.thumbs = tk.Frame(self.thumb_canvas, bg=FIG_SURFACE)
+        self.thumbs = tk.Frame(self.thumb_canvas, bg=FIG_BG)
         self._thumb_canvas_window = self.thumb_canvas.create_window(
             (0, 0), window=self.thumbs, anchor=tk.NW,
         )
@@ -917,12 +1512,16 @@ class AutoRawGui(tk.Tk):
         ctrl_wrap = tk.Frame(bottom, bg=FIG_PANEL)
         ctrl_wrap.pack(fill=tk.X, padx=16, pady=(10, 0))
 
-        ctrl = tk.Frame(ctrl_wrap, bg=FIG_PANEL)
-        ctrl.pack(fill=tk.X)
-        self.offset_x = self._slider(ctrl, "X",        -450,  450,    self.update_current, "{:.0f}")
-        self.offset_y = self._slider(ctrl, "Y",        -350,  350,    self.update_current, "{:.0f}")
-        self.zoom     = self._slider(ctrl, "Масштаб",   0.5,  ZOOM_MAX, self.update_current, "{:.2f}")
-        self.rotation = self._slider(ctrl, "Поворот",  -20,   20,     self.update_current, "{:.1f}°")
+        # row 1 — position
+        row1 = tk.Frame(ctrl_wrap, bg=FIG_PANEL)
+        row1.pack(fill=tk.X)
+        self.offset_x = self._slider(row1, "X",       -450,  450,     self.update_current, "{:.0f}")
+        self.offset_y = self._slider(row1, "Y",       -350,  350,     self.update_current, "{:.0f}")
+        # row 2 — transform
+        row2 = tk.Frame(ctrl_wrap, bg=FIG_PANEL)
+        row2.pack(fill=tk.X, pady=(6, 0))
+        self.zoom     = self._slider(row2, "Масштаб",  0.5,  ZOOM_MAX, self.update_current, "{:.2f}")
+        self.rotation = self._slider(row2, "Поворот", -20,   20,      self.update_current, "{:.1f}°")
         self.zoom.set(1.0)
 
         rb = tk.Frame(ctrl_wrap, bg=FIG_PANEL)
@@ -947,8 +1546,12 @@ class AutoRawGui(tk.Tk):
         cc_head = tk.Frame(cc_wrap, bg=FIG_PANEL)
         cc_head.pack(fill=tk.X, pady=(0, 8))
 
-        tk.Label(cc_head, text="ЦВЕТОКОР", bg=FIG_PANEL, fg=FIG_TEXT2,
-                 font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
+        # mini accent pip + label
+        pip_row = tk.Frame(cc_head, bg=FIG_PANEL)
+        pip_row.pack(side=tk.LEFT)
+        tk.Frame(pip_row, bg=FIG_ACCENT, width=3, height=12).pack(side=tk.LEFT, padx=(0, 6))
+        tk.Label(pip_row, text="ЦВЕТОКОР", bg=FIG_PANEL, fg=FIG_TEXT2,
+                 font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT)
 
         # switch + action buttons on the right
         cc_right = tk.Frame(cc_head, bg=FIG_PANEL)
@@ -962,55 +1565,63 @@ class AutoRawGui(tk.Tk):
         ttk.Button(cc_right, text="Применить к папке",
                    command=self.apply_look_to_folder).pack(side=tk.LEFT)
 
-        # ── row 1: spinbox fields ─────────────────────────────────────
+        # ── compact sliders (2 × 2) ───────────────────────────────────
         cc_fields = tk.Frame(cc_wrap, bg=FIG_PANEL)
-        cc_fields.pack(fill=tk.X)
-        fields = [
-            ("Контраст",    self.contrast_var,    -100, 100),
-            ("Тени",        self.shadows_var,      -100, 100),
-            ("Температура", self.temperature_var, 2000, 10000),
-            ("Оттенок",     self.tint_var,         -100, 100),
-        ]
-        for lbl, var, lo, hi in fields:
-            cell = tk.Frame(cc_fields, bg=FIG_PANEL)
-            cell.pack(side=tk.LEFT, padx=(0, 18))
-            tk.Label(cell, text=lbl, bg=FIG_PANEL, fg=FIG_TEXT2,
-                     font=("Segoe UI", 9)).pack(anchor="w")
-            sp = ttk.Spinbox(cell, from_=lo, to=hi, textvariable=var,
-                             width=6, command=self.update_current)
-            sp.pack(anchor="w")
-            sp.bind("<KeyRelease>", lambda _e: self.update_current())
+        cc_fields.pack(fill=tk.X, pady=(4, 0))
 
-    def _slider(self, parent: tk.Frame, label: str, start: float, end: float,
-                command, fmt: str = "{:.0f}") -> tk.DoubleVar:
+        cc_row1 = tk.Frame(cc_fields, bg=FIG_PANEL)
+        cc_row1.pack(fill=tk.X)
+        cc_row2 = tk.Frame(cc_fields, bg=FIG_PANEL)
+        cc_row2.pack(fill=tk.X, pady=(4, 0))
+
+        self._slider(cc_row1, "Контраст",    -100,  100,   self.update_current,
+                     "{:.0f}",  compact=True, existing_var=self.contrast_var)
+        self._slider(cc_row1, "Тени",        -100,  100,   self.update_current,
+                     "{:.0f}",  compact=True, existing_var=self.shadows_var)
+        self._slider(cc_row2, "Температура", 2000, 10000,  self.update_current,
+                     "{:.0f}K", compact=True, existing_var=self.temperature_var)
+        self._slider(cc_row2, "Оттенок",     -100,  100,   self.update_current,
+                     "{:.0f}",  compact=True, existing_var=self.tint_var)
+
+    def _slider(
+        self,
+        parent: tk.Frame,
+        label: str,
+        start: float,
+        end: float,
+        command,
+        fmt: str = "{:.0f}",
+        compact: bool = False,
+        existing_var: tk.Variable | None = None,
+    ) -> tk.DoubleVar:
+        """Canvas slider — thin track, accent fill, round thumb.
+        compact=True → smaller (used for colour-correction row).
+        existing_var → reuse an existing IntVar/DoubleVar instead of creating a new one.
         """
-        Custom Canvas slider inspired by Adobe Photoshop:
-          - thin dark track, accent-filled left portion
-          - round light-gray thumb (visible against dark trough)
-          - drag with mouse, fine-tune with scroll wheel
-          - returns tk.DoubleVar (same interface as before)
-        """
-        TRACK_H = 3
-        THUMB_R = 7
+        TRACK_H  = 2 if compact else 3
+        THUMB_R  = 5 if compact else 7
+        CANVAS_H = 14 if compact else 20
+        FONT_SZ  = 8 if compact else 9
         BG = FIG_PANEL
 
         col = tk.Frame(parent, bg=BG)
-        col.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 16))
+        col.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 12 if compact else 16))
 
-        # ── header row: name left | value right ───
         hdr = tk.Frame(col, bg=BG)
         hdr.pack(fill=tk.X, pady=(0, 1))
         tk.Label(hdr, text=label, bg=BG, fg=FIG_TEXT2,
-                 font=("Segoe UI", 9)).pack(side=tk.LEFT)
-        val_str = tk.StringVar(value=fmt.format(0.0))
+                 font=("Segoe UI", FONT_SZ)).pack(side=tk.LEFT)
+        val_str = tk.StringVar()
         tk.Label(hdr, textvariable=val_str, bg=BG, fg=FIG_ACCENT,
-                 font=("Segoe UI", 9, "bold"), width=7, anchor="e").pack(side=tk.RIGHT)
+                 font=("Segoe UI", FONT_SZ, "bold"),
+                 width=6 if compact else 7, anchor="e").pack(side=tk.RIGHT)
 
-        var = tk.DoubleVar(value=0.0)
+        var: tk.Variable = existing_var if existing_var is not None else tk.DoubleVar(value=0.0)
+        val_str.set(fmt.format(var.get()))
 
-        # ── canvas slider ───
-        c = tk.Canvas(col, height=20, bg=BG, highlightthickness=0, bd=0, cursor="hand2")
-        c.pack(fill=tk.X, pady=(2, 4))
+        c = tk.Canvas(col, height=CANVAS_H, bg=BG,
+                      highlightthickness=0, bd=0, cursor="hand2")
+        c.pack(fill=tk.X, pady=(1, 3 if compact else 4))
 
         resolution = 0.01 if abs(end - start) <= 10 else 1.0
 
@@ -1019,20 +1630,17 @@ class AutoRawGui(tk.Tk):
             if w < 6:
                 return
             c.delete("all")
-            cy = 10
-            r = THUMB_R
-            # full track
+            cy  = CANVAS_H // 2
+            r   = THUMB_R
             c.create_rectangle(r, cy - TRACK_H // 2,
                                 w - r, cy + TRACK_H // 2 + 1,
                                 fill=SL_TRACK, outline="", tags="track")
-            # filled (left) portion
             ratio = max(0.0, min(1.0, (var.get() - start) / (end - start)))
             tx = r + ratio * (w - 2 * r)
             if tx > r + 1:
                 c.create_rectangle(r, cy - TRACK_H // 2,
                                    tx, cy + TRACK_H // 2 + 1,
                                    fill=SL_ACTIVE, outline="", tags="active")
-            # thumb
             c.create_oval(tx - r, cy - r, tx + r, cy + r,
                           fill=SL_THUMB, outline=SL_THUMB_BD, width=1, tags="thumb")
 
@@ -1048,7 +1656,7 @@ class AutoRawGui(tk.Tk):
             command()
 
         def _on_scroll(event: tk.Event) -> None:
-            step = resolution * (10 if event.state & 0x1 else 1)  # Shift = ×10
+            step  = resolution * (10 if event.state & 0x1 else 1)
             delta = step if event.delta > 0 else -step
             var.set(max(start, min(end, var.get() + delta)))
             command()
@@ -1057,9 +1665,12 @@ class AutoRawGui(tk.Tk):
         c.bind("<ButtonPress-1>", lambda e: _set(e.x))
         c.bind("<B1-Motion>",     lambda e: _set(e.x))
         c.bind("<MouseWheel>",    _on_scroll)
-        var.trace_add("write", lambda *_: (val_str.set(fmt.format(var.get())), c.after_idle(_redraw)))
+        var.trace_add("write", lambda *_: (
+            val_str.set(fmt.format(var.get())),
+            c.after_idle(_redraw),
+        ))
 
-        return var
+        return var  # type: ignore[return-value]
 
     def _on_thumb_mousewheel(self, event: tk.Event) -> None:
         if not self.thumb_canvas.winfo_exists():
@@ -1109,6 +1720,7 @@ class AutoRawGui(tk.Tk):
         win.transient(self)
         win.grab_set()
         win.configure(bg=FIG_BG)
+        self._prepare_dialog_window(win)
         self.drop_window = win
 
         panel = tk.Frame(win, bg=FIG_PANEL,
@@ -1439,6 +2051,36 @@ class AutoRawGui(tk.Tk):
             else:
                 btn.configure(highlightbackground=FIG_BORDER, highlightthickness=1, bd=0)
 
+    def _refresh_single_thumb(self, index: int) -> None:
+        """Re-render one thumbnail in-place without rebuilding the whole panel."""
+        frames = self.current_frames()
+        if not frames or not (0 <= index < len(frames)):
+            return
+        if not hasattr(self, "thumb_btns") or index >= len(self.thumb_btns):
+            return
+        btn = self.thumb_btns[index]
+        if not btn.winfo_exists():
+            return
+
+        state = frames[index]
+        state.thumb_cache = None  # force re-render
+        thumb = render_frame(state, THUMB_SIZE)
+        if self.use_colorcor_var.get():
+            thumb = apply_standard_look(
+                thumb,
+                contrast=state.contrast,
+                shadows=state.shadows,
+                temperature=state.temperature,
+                tint=state.tint,
+            )
+        state.thumb_cache = thumb
+        photo = ImageTk.PhotoImage(thumb)
+        btn.configure(image=photo)
+        # Keep strong reference so GC doesn't collect it
+        btn.image = photo  # type: ignore[attr-defined]
+        if hasattr(self, "thumb_photos") and index < len(self.thumb_photos):
+            self.thumb_photos[index] = photo
+
     def render_thumbnails(self) -> None:
         for child in self.thumbs.winfo_children():
             child.destroy()
@@ -1458,9 +2100,8 @@ class AutoRawGui(tk.Tk):
             card.grid(row=index // 2, column=index % 2, padx=4, pady=5, sticky="n")
             card.configure(highlightthickness=1, highlightbackground=FIG_BORDER)
 
-            badge_row = tk.Frame(card, bg=FIG_SURFACE, width=card_w)
+            badge_row = tk.Frame(card, bg=FIG_SURFACE)
             badge_row.pack(fill=tk.X, pady=(0, 2))
-            badge_row.pack_propagate(False)
             tk.Label(badge_row, text=f"  {state.frame}", bg=FIG_ACCENT if is_selected else FIG_BTN,
                      fg="#ffffff", font=("Segoe UI", 8, "bold"),
                      padx=4, pady=1).pack(side=tk.LEFT)
@@ -1551,8 +2192,12 @@ class AutoRawGui(tk.Tk):
         state.tint = self._coerce_int(self.tint_var, STANDARD_TINT, -100, 100)
 
     def select_frame(self, index: int, *, save_previous: bool = True) -> None:
+        prev_index = self.selected_index
         if save_previous:
             self._save_controls_to_current()
+            # Update the thumbnail we're leaving so it reflects any edits
+            if prev_index != index:
+                self.after_idle(lambda i=prev_index: self._refresh_single_thumb(i))
         frames = self.current_frames()
         if not frames:
             self.info_var.set("В выбранной папке нет кадров")
@@ -1581,6 +2226,7 @@ class AutoRawGui(tk.Tk):
         self.preview.focus_set()
         self._highlight_selected_thumb()
         self.render_preview()
+        self._auto_load_etalon()
 
     def current(self) -> FrameState | None:
         frames = self.current_frames()
@@ -1702,11 +2348,977 @@ class AutoRawGui(tk.Tk):
             y = (CANVAS_SIZE[1] - rule.y_bottom_px) * sy
             self.preview.create_line(0, y, PREVIEW_SIZE[0], y, fill=blue, width=2)
 
+    # ── hotkeys dialog ───────────────────────────────────────────────
+    # ── image extensions for reference scanning ───────────────────────
+    _IMG_EXTS: frozenset[str] = frozenset(
+        {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp"}
+    )
+
+    def _auto_load_etalon(self) -> None:
+        """Auto-select the matching reference image for the current frame.
+
+        Looks for:  <root_folder>/reference/<selected_folder_name>/<images sorted>
+        and picks the image at self.selected_index (clamped to available count).
+        Falls back to the manually saved etalon path if no reference folder is found.
+        """
+        if not self.root_folder or not self.selected_folder:
+            self._display_etalon(self._etalon_path)
+            return
+
+        # Candidate locations for the reference root folder
+        ref_root: Path | None = None
+        for candidate in (
+            self.root_folder / "reference",
+            self.root_folder.parent / "reference",
+        ):
+            if candidate.is_dir():
+                ref_root = candidate
+                break
+
+        if ref_root is None:
+            self._display_etalon(self._etalon_path)
+            return
+
+        # Find subfolder matching selected_folder name (case-insensitive)
+        target_name = self.selected_folder.name.lower()
+        ref_subdir: Path | None = None
+        for d in ref_root.iterdir():
+            if d.is_dir() and d.name.lower() == target_name:
+                ref_subdir = d
+                break
+
+        if ref_subdir is None:
+            self._display_etalon(self._etalon_path)
+            return
+
+        images = sorted(
+            f for f in ref_subdir.iterdir()
+            if f.is_file() and f.suffix.lower() in self._IMG_EXTS
+        )
+        if not images:
+            self._display_etalon(self._etalon_path)
+            return
+
+        idx = min(self.selected_index, len(images) - 1)
+        self._display_etalon(str(images[idx]))
+
+    # ══════════════════════════════════════════════════════════════
+    #  System status bar
+    # ══════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _sys_color(pct: float) -> str:
+        if pct < 40: return "#22c55e"
+        if pct < 65: return "#eab308"
+        if pct < 80: return "#f97316"
+        return "#ef4444"
+
+    @staticmethod
+    def _temp_color(deg: float, *, gpu: bool = False) -> str:
+        warn  = 75 if gpu else 65
+        crit  = 90 if gpu else 80
+        if deg < warn:  return "#22c55e"
+        if deg < crit:  return "#f97316"
+        return "#ef4444"
+
+    @staticmethod
+    def _check_net_ms() -> float | None:
+        """TCP connect to well-known hosts on port 80; return round-trip ms or None."""
+        targets = [
+            ("8.8.8.8",      80),   # Google DNS via HTTP port
+            ("1.1.1.1",      80),   # Cloudflare
+            ("www.google.com", 80),
+        ]
+        for host, port in targets:
+            try:
+                t0 = time.perf_counter()
+                with socket.create_connection((host, port), timeout=2.0):
+                    pass
+                return (time.perf_counter() - t0) * 1000
+            except OSError:
+                continue
+        return None
+
+    @staticmethod
+    def _net_bars_info(ms: float | None) -> tuple[int, str]:
+        if ms is None:  return 0, "#6b7280"
+        if ms < 50:     return 5, "#22c55e"
+        if ms < 100:    return 4, "#84cc16"
+        if ms < 200:    return 3, "#eab308"
+        if ms < 500:    return 2, "#f97316"
+        return 1, "#ef4444"
+
+    def _build_sysbar(self, parent: tk.Frame) -> None:
+        """Populate the system status bar widgets."""
+        def _sep() -> None:
+            tk.Label(parent, text="│", bg=FIG_PANEL, fg=FIG_BORDER,
+                     font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=4)
+
+        # ── User name ──────────────────────────────────────────────
+        user_name = _load_config().get("user_name", "Иван")
+        self._sysbar_user_var = tk.StringVar(value=f"👤  {user_name}")
+        user_lbl = tk.Label(
+            parent, textvariable=self._sysbar_user_var,
+            bg=FIG_PANEL, fg=FIG_TEXT, font=("Segoe UI", 8),
+            cursor="hand2", padx=10,
+        )
+        user_lbl.pack(side=tk.LEFT)
+        user_lbl.bind("<Button-1>", lambda _e: self._change_username())
+
+        _sep()
+
+        # ── Internet signal bars ────────────────────────────────────
+        tk.Label(parent, text="🌐", bg=FIG_PANEL, fg=FIG_TEXT2,
+                 font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(2, 3))
+        self._sysbar_net_canvas = tk.Canvas(
+            parent, width=29, height=14, bg=FIG_PANEL, highlightthickness=0,
+        )
+        self._sysbar_net_canvas.pack(side=tk.LEFT, padx=(0, 6))
+        self._draw_signal_bars(0, "#6b7280")
+
+        _sep()
+
+        # ── CPU ────────────────────────────────────────────────────
+        tk.Label(parent, text="CPU", bg=FIG_PANEL, fg=FIG_TEXT2,
+                 font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=(6, 2))
+        self._sysbar_cpu_var = tk.StringVar(value="—")
+        self._sysbar_cpu_lbl = tk.Label(
+            parent, textvariable=self._sysbar_cpu_var,
+            bg=FIG_PANEL, fg=FIG_TEXT2, font=("Segoe UI", 8, "bold"), width=4,
+        )
+        self._sysbar_cpu_lbl.pack(side=tk.LEFT)
+        self._sysbar_cpu_temp_var = tk.StringVar(value="")
+        self._sysbar_cpu_temp_lbl = tk.Label(
+            parent, textvariable=self._sysbar_cpu_temp_var,
+            bg=FIG_PANEL, fg=FIG_TEXT2, font=("Segoe UI", 8), width=5,
+        )
+        self._sysbar_cpu_temp_lbl.pack(side=tk.LEFT)
+
+        _sep()
+
+        # ── GPU ────────────────────────────────────────────────────
+        tk.Label(parent, text="GPU", bg=FIG_PANEL, fg=FIG_TEXT2,
+                 font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=(6, 2))
+        self._sysbar_gpu_var = tk.StringVar(value="—")
+        self._sysbar_gpu_lbl = tk.Label(
+            parent, textvariable=self._sysbar_gpu_var,
+            bg=FIG_PANEL, fg=FIG_TEXT2, font=("Segoe UI", 8, "bold"), width=4,
+        )
+        self._sysbar_gpu_lbl.pack(side=tk.LEFT)
+        self._sysbar_gpu_temp_var = tk.StringVar(value="")
+        self._sysbar_gpu_temp_lbl = tk.Label(
+            parent, textvariable=self._sysbar_gpu_temp_var,
+            bg=FIG_PANEL, fg=FIG_TEXT2, font=("Segoe UI", 8), width=5,
+        )
+        self._sysbar_gpu_temp_lbl.pack(side=tk.LEFT)
+
+        _sep()
+
+        # ── RAM ────────────────────────────────────────────────────
+        tk.Label(parent, text="RAM", bg=FIG_PANEL, fg=FIG_TEXT2,
+                 font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=(6, 2))
+        self._sysbar_ram_var = tk.StringVar(value="—  ")
+        self._sysbar_ram_lbl = tk.Label(
+            parent, textvariable=self._sysbar_ram_var,
+            bg=FIG_PANEL, fg=FIG_TEXT2, font=("Segoe UI", 8, "bold"), width=5,
+        )
+        self._sysbar_ram_lbl.pack(side=tk.LEFT)
+
+    def _draw_signal_bars(self, bars: int, color: str) -> None:
+        """Draw 5-bar WiFi-style signal indicator on the net canvas."""
+        if not hasattr(self, "_sysbar_net_canvas"):
+            return
+        c = self._sysbar_net_canvas
+        c.delete("all")
+        bar_w, gap, max_h = 3, 2, 12
+        for i in range(5):
+            h = max(2, int(max_h * (i + 1) / 5))
+            x1 = i * (bar_w + gap)
+            y1 = max_h - h
+            x2 = x1 + bar_w
+            y2 = max_h
+            fill = color if i < bars else FIG_BORDER
+            c.create_rectangle(x1, y1, x2, y2, fill=fill, outline="")
+
+    def _update_sysbar(
+        self,
+        cpu: float,
+        cpu_temp: float | None,
+        gpu: float | None,
+        gpu_temp: float | None,
+        ram: float,
+        net_ms: float | None,
+    ) -> None:
+        """Apply fresh monitoring values to the status bar (called on main thread)."""
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+
+        col  = self._sys_color
+        tcol = self._temp_color
+
+        # CPU
+        if hasattr(self, "_sysbar_cpu_var"):
+            if cpu >= 0:
+                self._sysbar_cpu_var.set(f"{cpu:.0f}%")
+                self._sysbar_cpu_lbl.configure(fg=col(cpu))
+            else:
+                self._sysbar_cpu_var.set("N/I")
+                self._sysbar_cpu_lbl.configure(fg=FIG_TEXT2)
+        if hasattr(self, "_sysbar_cpu_temp_var"):
+            if cpu_temp is not None:
+                self._sysbar_cpu_temp_var.set(f"{cpu_temp:.0f}°C")
+                self._sysbar_cpu_temp_lbl.configure(fg=tcol(cpu_temp, gpu=False))
+            else:
+                self._sysbar_cpu_temp_var.set("")
+
+        # GPU
+        if hasattr(self, "_sysbar_gpu_var"):
+            if gpu is not None:
+                self._sysbar_gpu_var.set(f"{gpu:.0f}%")
+                self._sysbar_gpu_lbl.configure(fg=col(gpu))
+            else:
+                self._sysbar_gpu_var.set("N/A")
+                self._sysbar_gpu_lbl.configure(fg=FIG_TEXT2)
+        if hasattr(self, "_sysbar_gpu_temp_var"):
+            if gpu_temp is not None:
+                self._sysbar_gpu_temp_var.set(f"{gpu_temp:.0f}°C")
+                self._sysbar_gpu_temp_lbl.configure(fg=tcol(gpu_temp, gpu=True))
+            else:
+                self._sysbar_gpu_temp_var.set("")
+
+        # RAM
+        if hasattr(self, "_sysbar_ram_var"):
+            if ram >= 0:
+                self._sysbar_ram_var.set(f"{ram:.0f}%")
+                self._sysbar_ram_lbl.configure(fg=col(ram))
+            else:
+                self._sysbar_ram_var.set("N/I")
+                self._sysbar_ram_lbl.configure(fg=FIG_TEXT2)
+
+        bars, net_color = self._net_bars_info(net_ms)
+        self._draw_signal_bars(bars, net_color)
+
+    def _start_sysmon(self) -> None:
+        """Launch background daemon thread for system monitoring."""
+        t = threading.Thread(target=self._run_sysmon, daemon=True)
+        t.start()
+
+    def _run_sysmon(self) -> None:
+        """Background loop: read CPU/GPU/RAM/net, schedule UI update every ~4 s."""
+
+        # ── One-time GPU detection ─────────────────────────────────
+        _use_pynvml    = _HAS_GPU and _pynvml is not None
+        _use_nvidiasmi = False
+        if not _use_pynvml:
+            try:
+                r = subprocess.run(
+                    ["nvidia-smi",
+                     "--query-gpu=utilization.gpu",
+                     "--format=csv,noheader,nounits"],
+                    timeout=4,
+                    creationflags=0x08000000,   # CREATE_NO_WINDOW on Windows
+                    **_SUBPROC_TEXT,
+                )
+                if r.returncode == 0:
+                    _use_nvidiasmi = True
+            except Exception:
+                pass
+
+        while True:
+            try:
+                alive = self.winfo_exists()
+            except Exception:
+                break
+            if not alive:
+                break
+
+            # CPU — interval=1 blocks 1 sec but gives accurate reading every call
+            if _psutil is not None:
+                cpu = float(_psutil.cpu_percent(interval=1))
+                ram = float(_psutil.virtual_memory().percent)
+            else:
+                cpu = -1.0
+                ram = -1.0
+
+            # CPU temperature
+            cpu_temp: float | None = None
+            if _psutil is not None:
+                try:
+                    temps = _psutil.sensors_temperatures()  # works on some Windows
+                    if temps:
+                        for key in ("coretemp", "cpu_thermal", "k10temp", "acpitz"):
+                            if key in temps and temps[key]:
+                                cpu_temp = float(temps[key][0].current)
+                                break
+                except Exception:
+                    pass
+            if cpu_temp is None:
+                # Fallback: wmic (works on most Windows without extra packages)
+                try:
+                    r = subprocess.run(
+                        ["wmic", "/namespace:\\\\root\\wmi", "PATH",
+                         "MSAcpi_ThermalZoneTemperature", "get", "CurrentTemperature"],
+                        timeout=3,
+                        creationflags=0x08000000,
+                        **_SUBPROC_TEXT,
+                    )
+                    nums = [l.strip() for l in r.stdout.splitlines()
+                            if l.strip().isdigit()]
+                    if nums:
+                        cpu_temp = (int(nums[0]) - 2732) / 10.0
+                except Exception:
+                    pass
+
+            # GPU load + temperature
+            gpu: float | None = None
+            gpu_temp: float | None = None
+            if _use_pynvml:
+                try:
+                    util = _pynvml.nvmlDeviceGetUtilizationRates(_GPU_HANDLE)
+                    gpu  = float(util.gpu)
+                    gpu_temp = float(
+                        _pynvml.nvmlDeviceGetTemperature(
+                            _GPU_HANDLE, _pynvml.NVML_TEMPERATURE_GPU
+                        )
+                    )
+                except Exception:
+                    pass
+            elif _use_nvidiasmi:
+                try:
+                    r = subprocess.run(
+                        ["nvidia-smi",
+                         "--query-gpu=utilization.gpu,temperature.gpu",
+                         "--format=csv,noheader,nounits"],
+                        timeout=4,
+                        creationflags=0x08000000,
+                        **_SUBPROC_TEXT,
+                    )
+                    if r.returncode == 0:
+                        parts = r.stdout.strip().splitlines()[0].split(",")
+                        gpu      = float(parts[0].strip())
+                        gpu_temp = float(parts[1].strip())
+                except Exception:
+                    pass
+
+            # Internet — try multiple hosts on port 80 (TCP, not blocked by firewall)
+            net_ms = self._check_net_ms()
+
+            try:
+                self.after(
+                    0,
+                    lambda c=cpu, ct=cpu_temp, g=gpu, gt=gpu_temp, r=ram, n=net_ms:
+                        self._update_sysbar(c, ct, g, gt, r, n),
+                )
+            except Exception:
+                break
+
+            time.sleep(2)
+
+    def _change_username(self) -> None:
+        """Prompt to rename the user shown in the status bar."""
+        from tkinter import simpledialog
+        current = _load_config().get("user_name", "Иван")
+        name = simpledialog.askstring(
+            "Имя пользователя", "Введите имя:", initialvalue=current, parent=self,
+        )
+        if name and name.strip():
+            name = name.strip()
+            cfg = _load_config()
+            cfg["user_name"] = name
+            _save_config(cfg)
+            if hasattr(self, "_sysbar_user_var"):
+                self._sysbar_user_var.set(f"👤  {name}")
+
+    def _pick_etalon(self) -> None:
+        """Open file dialog to manually choose a fallback etalon image."""
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Выберите эталонное изображение",
+            filetypes=[
+                ("Изображения", "*.jpg *.jpeg *.png *.tiff *.tif *.bmp *.webp"),
+                ("Все файлы", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        self._etalon_path = path
+        cfg = _load_config()
+        cfg["etalon"] = path
+        _save_config(cfg)
+        self._display_etalon(path)
+
+    def _display_etalon(self, path: str | None) -> None:
+        """Render the etalon image (or placeholder) in ref_canvas."""
+        if not hasattr(self, "ref_canvas"):
+            return
+        self.ref_canvas.delete("all")
+        if not path:
+            self.ref_canvas.create_text(
+                self._ref_w // 2, self._ref_h // 2 - 10,
+                text="Эталон не загружен", fill=FIG_TEXT2,
+                font=("Segoe UI", 10),
+            )
+            self.ref_canvas.create_text(
+                self._ref_w // 2, self._ref_h // 2 + 10,
+                text="Нажмите для выбора", fill=FIG_TEXT2,
+                font=("Segoe UI", 8),
+            )
+            return
+        try:
+            img = Image.open(path)
+            img = ImageOps.fit(img, (self._ref_w, self._ref_h), Image.LANCZOS)
+            self._ref_photo = ImageTk.PhotoImage(img)
+            self.ref_canvas.create_image(0, 0, image=self._ref_photo, anchor=tk.NW)
+            # Small "×" button to clear etalon
+            self.ref_canvas.create_rectangle(
+                self._ref_w - 20, 0, self._ref_w, 20,
+                fill="#00000088", outline="",
+            )
+            self.ref_canvas.create_text(
+                self._ref_w - 10, 10,
+                text="×", fill="white", font=("Segoe UI", 11, "bold"),
+                tags="clear_btn",
+            )
+            self.ref_canvas.tag_bind("clear_btn", "<Button-1>", lambda _e: self._clear_etalon())
+        except Exception:
+            self._display_etalon(None)
+
+    def _clear_etalon(self) -> None:
+        self._etalon_path = None
+        cfg = _load_config()
+        cfg.pop("etalon", None)
+        _save_config(cfg)
+        self._display_etalon(None)
+
+    # ══════════════════════════════════════════════════════════════
+    #  Zona (Telegram) notifications
+    # ══════════════════════════════════════════════════════════════
+
+    def _zona_ok(self) -> bool:
+        """Return True if Zona notifications are enabled and configured."""
+        cfg  = _load_config()
+        zona = _load_zona_data()
+        return bool(
+            cfg.get("zona_enabled")
+            and zona.get("TOKEN", "").strip()
+            and cfg.get("zona_chat_id", "").strip()
+        )
+
+    def _send_zona(self, text: str) -> None:
+        """Send a Telegram message in a daemon thread (fire-and-forget)."""
+        if not self._zona_ok():
+            return
+        zona    = _load_zona_data()
+        token   = zona["TOKEN"].strip()
+        cfg     = _load_config()
+        chat_id = cfg.get("zona_chat_id", "").strip()
+        user    = cfg.get("user_name", "").strip()
+        full_text = f"{text}\n\n<i>От: {user}</i>" if user else text
+
+        def _post() -> None:
+            import urllib.request, urllib.parse, json as _json
+            try:
+                url  = f"https://api.telegram.org/bot{token}/sendMessage"
+                body = _json.dumps({
+                    "chat_id": chat_id,
+                    "text": full_text,
+                    "parse_mode": "HTML",
+                }).encode()
+                req = urllib.request.Request(
+                    url, data=body,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                urllib.request.urlopen(req, timeout=8)
+            except Exception:
+                pass  # silent — don't disturb the user on network failure
+
+        threading.Thread(target=_post, daemon=True).start()
+
+    def show_zona_settings(self) -> None:
+        """Open Zona notification settings dialog."""
+        cfg  = _load_config()
+        zona = _load_zona_data()
+
+        bot_url   = zona.get("URL",   "@ZonaDeck_bot")
+        has_token = bool(zona.get("TOKEN", "").strip())
+        default_chat = zona.get("ID", "")  # default group from data.dat
+
+        win = tk.Toplevel(self)
+        win.title("Уведомления от Zona")
+        win.geometry("480x370")
+        win.resizable(False, False)
+        win.configure(bg=FIG_BG)
+        win.transient(self)
+        win.grab_set()
+        win.focus_set()
+        self._prepare_dialog_window(win)
+
+        pad = dict(padx=20)
+
+        # ── Bot info block (read-only) ──────────────────────────────
+        bot_frame = tk.Frame(win, bg=FIG_PANEL, padx=12, pady=10)
+        bot_frame.grid(row=0, column=0, columnspan=2, sticky="ew", **pad, pady=(16, 0))
+        tk.Label(bot_frame, text="Бот Zona", bg=FIG_PANEL, fg=FIG_TEXT,
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        tk.Label(bot_frame,
+                 text=f"{bot_url}  —  {'токен загружен ✓' if has_token else '⚠ data.dat не найден'}",
+                 bg=FIG_PANEL, fg=FIG_ACCENT if has_token else "#ef4444",
+                 font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 0))
+        tk.Label(bot_frame,
+                 text=f"Добавьте {bot_url} в свою группу и скопируйте ID группы ниже.",
+                 bg=FIG_PANEL, fg=FIG_TEXT2,
+                 font=("Segoe UI", 8), wraplength=420).pack(anchor="w", pady=(4, 0))
+
+        # ── Group ID (editable) ────────────────────────────────────
+        tk.Label(win, text="ID вашей группы / чата:", bg=FIG_BG, fg=FIG_TEXT,
+                 font=("Segoe UI", 9), anchor="w").grid(
+            row=1, column=0, sticky="w", pady=(14, 2), **pad)
+        current_chat = cfg.get("zona_chat_id", "") or default_chat
+        e_chat = ttk.Entry(win, font=("Segoe UI", 10), width=42)
+        e_chat.grid(row=2, column=0, columnspan=2, sticky="ew", **pad)
+        e_chat.insert(0, current_chat)
+
+        # ── Enable checkbox ────────────────────────────────────────
+        enabled_var = tk.BooleanVar(value=bool(cfg.get("zona_enabled", False)))
+        chk_frame = tk.Frame(win, bg=FIG_BG)
+        chk_frame.grid(row=3, column=0, columnspan=2, sticky="w", pady=(14, 0), **pad)
+        self._make_check(
+            chk_frame, bool(cfg.get("zona_enabled", False)),
+            lambda v: enabled_var.set(v),
+            bg=FIG_BG,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Label(chk_frame, text="Получать уведомления", bg=FIG_BG, fg=FIG_TEXT,
+                 font=("Segoe UI", 10)).pack(side=tk.LEFT)
+
+        # ── Status ─────────────────────────────────────────────────
+        status_var = tk.StringVar(value="")
+        tk.Label(win, textvariable=status_var, bg=FIG_BG, fg=FIG_TEXT2,
+                 font=("Segoe UI", 9)).grid(row=4, column=0, columnspan=2,
+                                            sticky="w", pady=(8, 0), **pad)
+
+        def _save() -> None:
+            new_cfg = _load_config()
+            new_cfg["zona_chat_id"] = e_chat.get().strip()
+            new_cfg["zona_enabled"] = enabled_var.get()
+            _save_config(new_cfg)
+            win.destroy()
+
+        def _test() -> None:
+            chat_id = e_chat.get().strip()
+            token   = zona.get("TOKEN", "").strip()
+            if not token:
+                status_var.set("⚠  data.dat не найден или пуст")
+                return
+            if not chat_id:
+                status_var.set("⚠  Введите ID группы")
+                return
+            status_var.set("Отправляю тестовое сообщение…")
+            win.update_idletasks()
+            import urllib.request, json as _json
+
+            def _worker() -> None:
+                try:
+                    url  = f"https://api.telegram.org/bot{token}/sendMessage"
+                    body = _json.dumps({
+                        "chat_id": chat_id,
+                        "text": (
+                            f"✅ <b>Zona подключена!</b>\n"
+                            f"AutoRAW Compressor будет присылать уведомления в эту группу."
+                        ),
+                        "parse_mode": "HTML",
+                    }).encode()
+                    req = urllib.request.Request(
+                        url, data=body,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=8) as r:
+                        resp = _json.loads(r.read())
+                    if resp.get("ok"):
+                        self.after(0, lambda: status_var.set("✅  Сообщение отправлено успешно"))
+                    else:
+                        err = resp.get("description", "неизвестная ошибка")
+                        self.after(0, lambda e=err: status_var.set(f"❌  Ошибка: {e}"))
+                except Exception as ex:
+                    self.after(0, lambda e=str(ex): status_var.set(f"❌  {e}"))
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        # ── Test button (full width, separate row) ─────────────────
+        ttk.Button(win, text="📨  Отправить тестовое сообщение",
+                   command=_test).grid(row=5, column=0, columnspan=2,
+                                       sticky="ew", pady=(14, 0), **pad)
+
+        # ── Save / Cancel ──────────────────────────────────────────
+        btn_frame = tk.Frame(win, bg=FIG_BG)
+        btn_frame.grid(row=6, column=0, columnspan=2, pady=(10, 16), sticky="e", **pad)
+        ttk.Button(btn_frame, text="Сохранить", style="Accent.TButton",
+                   command=_save).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_frame, text="Отмена",    command=win.destroy).pack(side=tk.LEFT)
+
+        win.columnconfigure(0, weight=1)
+
+    # ══════════════════════════════════════════════════════════════
+    #  About-menu dialogs
+    # ══════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _info_window(master: tk.Tk, title: str, w: int = 680, h: int = 520) -> tk.Toplevel:
+        """Create a styled modal-like Toplevel."""
+        win = tk.Toplevel(master)
+        win.title(title)
+        win.geometry(f"{w}x{h}")
+        win.resizable(True, True)
+        win.configure(bg=FIG_BG)
+        win.transient(master)
+        win.grab_set()
+        win.focus_set()
+        if hasattr(master, "_prepare_dialog_window"):
+            master._prepare_dialog_window(win)  # type: ignore[attr-defined]
+        return win
+
+    def _scrolled_text(self, parent: tk.Widget, **kw: object) -> tk.Text:
+        """Text widget + vertical scrollbar packed inside parent."""
+        frame = tk.Frame(parent, bg=FIG_BG)
+        frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=(8, 0))
+        sb = self._win11_sb(frame, orient=tk.VERTICAL)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        t = tk.Text(
+            frame,
+            wrap=tk.WORD,
+            yscrollcommand=sb.set,
+            bg=FIG_PANEL, fg=FIG_TEXT,
+            insertbackground=FIG_TEXT,
+            relief="flat", borderwidth=0,
+            padx=14, pady=10,
+            font=("Segoe UI", 10),
+            cursor="arrow",
+            **kw,
+        )
+        t.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.config(command=t.yview)
+        return t
+
+    def _apply_md_tags(self, t: tk.Text) -> None:
+        """Define Text tags used by the markdown renderer."""
+        t.tag_configure("h1",   font=("Segoe UI", 16, "bold"), foreground=FIG_ACCENT,  spacing3=6)
+        t.tag_configure("h2",   font=("Segoe UI", 13, "bold"), foreground=FIG_TEXT,    spacing3=4, spacing1=10)
+        t.tag_configure("h3",   font=("Segoe UI", 10, "bold"), foreground=FIG_ACCENT,  spacing3=2, spacing1=6)
+        t.tag_configure("body", font=("Segoe UI", 10),         foreground=FIG_TEXT)
+        t.tag_configure("li",   font=("Segoe UI", 10),         foreground=FIG_TEXT,    lmargin1=20, lmargin2=28)
+        t.tag_configure("code", font=("Consolas", 9),          foreground="#e5c07b",   background=FIG_BG)
+        t.tag_configure("bold", font=("Segoe UI", 10, "bold"), foreground=FIG_TEXT)
+        t.tag_configure("dim",  font=("Segoe UI", 9),          foreground=FIG_TEXT2)
+
+    def _insert_md(self, t: tk.Text, md: str) -> None:
+        """Minimal markdown → Text-widget renderer."""
+        import re
+        self._apply_md_tags(t)
+        t.configure(state=tk.NORMAL)
+        t.delete("1.0", tk.END)
+
+        for raw_line in md.splitlines():
+            line = raw_line.rstrip()
+
+            if line.startswith("### "):
+                t.insert(tk.END, line[4:] + "\n", "h3")
+            elif line.startswith("## "):
+                t.insert(tk.END, line[3:] + "\n", "h2")
+            elif line.startswith("# "):
+                t.insert(tk.END, line[2:] + "\n", "h1")
+            elif line.startswith("- ") or line.startswith("* "):
+                self._insert_inline(t, "• " + line[2:], "li")
+                t.insert(tk.END, "\n")
+            elif line == "" or line == "---":
+                t.insert(tk.END, "\n")
+            else:
+                self._insert_inline(t, line, "body")
+                t.insert(tk.END, "\n")
+
+        t.configure(state=tk.DISABLED)
+
+    @staticmethod
+    def _insert_inline(t: tk.Text, text: str, base_tag: str) -> None:
+        """Insert a line applying **bold** and `code` spans."""
+        import re
+        pattern = re.compile(r"`([^`]+)`|\*\*([^*]+)\*\*")
+        pos = 0
+        for m in pattern.finditer(text):
+            if m.start() > pos:
+                t.insert(tk.END, text[pos:m.start()], base_tag)
+            if m.group(1) is not None:
+                t.insert(tk.END, m.group(1), "code")
+            else:
+                t.insert(tk.END, m.group(2), "bold")
+            pos = m.end()
+        if pos < len(text):
+            t.insert(tk.END, text[pos:], base_tag)
+
+    # ── About ──────────────────────────────────────────────────────
+
+    def show_about(self) -> None:
+        from version import APP_NAME, VERSION
+        win = self._info_window(self, "О программе", 560, 400)
+        t = self._scrolled_text(win)
+        self._insert_md(t, f"""\
+# {APP_NAME}
+
+**Версия:** {VERSION}
+
+## Описание
+
+AutoRAW Compressor — инструмент пакетной обработки фотографий товаров.
+Позволяет загрузить папку с RAW/JPEG-съёмками, настроить кадрирование
+каждого снимка вручную и экспортировать результат в заданное разрешение.
+
+## Основные возможности
+
+- Загрузка папки с изображениями (RAW, JPEG, PNG, TIFF)
+- Предпросмотр кадра в реальном времени
+- Настройка позиции (X/Y), масштаба и поворота
+- Автодетекция товара на снимке
+- Цветокоррекция: контраст, тени, температура, оттенок
+- Эталонный референс для сравнения с образцом
+- Пакетный экспорт выбранных кадров
+- Тёмная / светлая / системная тема
+- Мониторинг CPU / GPU / RAM / сети
+
+## Репозиторий
+
+`gitverse.ru/delbraun/AutoRAWCompressor`
+""")
+        ttk.Button(win, text="Закрыть", command=win.destroy).pack(pady=10)
+
+    # ── Manual ─────────────────────────────────────────────────────
+
+    def show_manual(self) -> None:
+        win = self._info_window(self, "Инструкция", 700, 580)
+        t = self._scrolled_text(win)
+        self._insert_md(t, """\
+# Инструкция пользователя
+
+## 1. Загрузка папки
+
+Введите путь в поле вверху или нажмите `📂` для выбора.
+Перетащите папку или файл прямо в окно программы.
+В дереве слева появится список подпапок — выберите нужную.
+
+## 2. Выбор кадра
+
+Миниатюры отображаются в правой панели.
+Нажмите на миниатюру для выбора кадра.
+Галочка на миниатюре включает / исключает кадр из экспорта.
+Стрелки клавиатуры переключают между кадрами.
+
+## 3. Настройка кадра
+
+**Мышь на холсте превью:**
+
+- Зажатая ЛКМ — свободное перемещение по X и Y
+- `Alt` + ЛКМ — движение строго по оси X
+- `Shift` + ЛКМ — движение строго по оси Y
+- `Ctrl` + ЛКМ — поворот фотографии
+- Колесо мыши — масштаб ±4%
+- `Alt` + колесо — масштаб ±1% (точная настройка)
+
+**Слайдеры панели управления:**
+
+- **X / Y** — смещение кадра в пикселях холста
+- **Масштаб** — зум от 0.5× до 3.0×
+- **Поворот** — угол от −20° до +20°
+
+**Кнопки:**
+- `Сбросить кадр` — обнуляет все параметры текущего кадра
+- `Сбросить папку` — обнуляет параметры всех кадров папки
+
+## 4. Эталон (референс)
+
+В правой панели вверху — виджет эталона.
+Он автоматически подгружает изображение из папки `reference/<имя_папки>/`
+в зависимости от выбранного кадра.
+
+Структура папок:
+```
+Корень/
+  Sneakers/       <- рабочие кадры
+  reference/
+    Sneakers/     <- эталоны (1.jpg = кадр 1, и т.д.)
+```
+
+Нажмите на виджет чтобы выбрать эталон вручную.
+Нажмите `×` в углу виджета для сброса.
+
+## 5. Цветокоррекция
+
+Включите переключатель **Цветокор** в нижней панели.
+Настройте параметры слайдерами:
+- **Контраст** — от −100 до +100
+- **Тени** — от −100 до +100
+- **Температура** — от 2000 К до 10000 К
+- **Оттенок** — от −100 до +100
+
+`Сохранить` — применить настройки к текущему кадру.
+`Применить к папке` — скопировать настройки на все кадры папки.
+
+## 6. Экспорт
+
+Нажмите `Экспорт` в верхней панели.
+Экспортируются только кадры с активной галочкой.
+""")
+        ttk.Button(win, text="Закрыть", command=win.destroy).pack(pady=10)
+
+    # ── Changelog ──────────────────────────────────────────────────
+
+    def show_changelog(self) -> None:
+        win = self._info_window(self, "Что изменилось", 700, 560)
+        t = self._scrolled_text(win)
+        try:
+            text = resource_path("CHANGELOG.md").read_text(encoding="utf-8")
+        except Exception:
+            text = "_Файл CHANGELOG.md не найден._"
+        self._insert_md(t, text)
+        ttk.Button(win, text="Закрыть", command=win.destroy).pack(pady=10)
+
+    # ── Check updates ──────────────────────────────────────────────
+
+    def check_updates(self) -> None:
+        """Launch background update check, show progress then result."""
+        win = self._info_window(self, "Проверка обновлений…", 420, 140)
+        lbl = tk.Label(win, text="Подключаемся к репозиторию…",
+                       bg=FIG_BG, fg=FIG_TEXT2, font=("Segoe UI", 10))
+        lbl.pack(expand=True)
+
+        def _worker() -> None:
+            import urllib.request, json as _json
+            from version import VERSION
+            result: str
+            try:
+                url = (
+                    "https://gitverse.ru/api/v1/repos/"
+                    "delbraun/AutoRAWCompressor/releases/latest"
+                )
+                req = urllib.request.Request(
+                    url, headers={"Accept": "application/json", "User-Agent": "AutoRAWCompressor"}
+                )
+                with urllib.request.urlopen(req, timeout=6) as r:
+                    data = _json.loads(r.read())
+                latest = data.get("tag_name", "").lstrip("v")
+                current = VERSION.lstrip("v")
+                if latest and latest != current:
+                    result = f"Доступна новая версия: {latest}\n\nТекущая: {current}\n\nСкачать: gitverse.ru/delbraun/AutoRAWCompressor"
+                else:
+                    result = f"У вас последняя версия.\n\nТекущая: {current}"
+            except Exception as e:
+                result = f"Не удалось проверить обновления.\n\n{e}"
+
+            def _show() -> None:
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+                messagebox.showinfo("Проверка обновлений", result)
+
+            try:
+                self.after(0, _show)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def show_hotkeys(self) -> None:
+        win = tk.Toplevel(self)
+        win.title("Управление и горячие клавиши")
+        win.geometry("560x460")
+        win.resizable(False, False)
+        win.configure(bg=FIG_BG)
+        win.transient(self)
+        win.grab_set()
+        self._prepare_dialog_window(win)
+
+        # ── Header ────────────────────────────────────────────────────
+        hdr = tk.Frame(win, bg=FIG_PANEL)
+        hdr.pack(fill=tk.X)
+        tk.Frame(hdr, bg=FIG_ACCENT, width=4).pack(side=tk.LEFT, fill=tk.Y)
+        tk.Label(hdr, text="Управление и горячие клавиши",
+                 bg=FIG_PANEL, fg=FIG_TEXT,
+                 font=("Segoe UI", 11, "bold"),
+                 padx=16, pady=12).pack(side=tk.LEFT)
+        tk.Frame(win, bg=FIG_BORDER, height=1).pack(fill=tk.X)
+
+        # ── Content ───────────────────────────────────────────────────
+        scroll_frame = tk.Frame(win, bg=FIG_BG)
+        scroll_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=12)
+
+        SECTIONS: list[tuple[str | None, list[tuple[str, str]]]] = [
+            ("Холст — перемещение", [
+                ("ЛКМ (тянуть)",        "Свободное перемещение объекта"),
+                ("Alt + ЛКМ",           "Движение строго по оси X"),
+                ("Shift + ЛКМ",         "Движение строго по оси Y"),
+                ("Ctrl + ЛКМ",          "Поворот фотографии"),
+                ("← → ↑ ↓",            "Сдвиг на 1 px"),
+            ]),
+            ("Холст — масштаб", [
+                ("Колесо мыши",         "Зум  ±4%"),
+                ("Alt + колесо мыши",   "Точный зум  ±1%"),
+            ]),
+            ("Миниатюры", [
+                ("Клик по миниатюре",   "Выбрать кадр"),
+                ("Колесо мыши",         "Прокрутка списка кадров"),
+            ]),
+            ("Прочее", [
+                ("F1",                  "Эта справка"),
+            ]),
+        ]
+
+        for section_title, rows in SECTIONS:
+            # section header
+            sec_row = tk.Frame(scroll_frame, bg=FIG_BG)
+            sec_row.pack(fill=tk.X, pady=(10, 4))
+            tk.Frame(sec_row, bg=FIG_ACCENT, width=3, height=13).pack(side=tk.LEFT, padx=(0, 7))
+            tk.Label(sec_row, text=(section_title or "").upper(),
+                     bg=FIG_BG, fg=FIG_TEXT2,
+                     font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT, anchor="w")
+
+            for key_text, desc_text in rows:
+                row = tk.Frame(scroll_frame, bg=FIG_BG)
+                row.pack(fill=tk.X, pady=2)
+
+                # Key badge
+                badge = tk.Frame(row, bg=FIG_PANEL,
+                                 highlightthickness=1, highlightbackground=FIG_BORDER)
+                badge.pack(side=tk.LEFT)
+                tk.Label(badge, text=key_text, bg=FIG_PANEL, fg=FIG_TEXT,
+                         font=("Segoe UI", 9, "bold"),
+                         padx=10, pady=3, width=22, anchor="w").pack()
+
+                # Description
+                tk.Label(row, text=desc_text, bg=FIG_BG, fg=FIG_TEXT2,
+                         font=("Segoe UI", 9), padx=14).pack(side=tk.LEFT, anchor="w")
+
+        # ── Footer ────────────────────────────────────────────────────
+        tk.Frame(win, bg=FIG_BORDER, height=1).pack(fill=tk.X)
+        foot = tk.Frame(win, bg=FIG_PANEL)
+        foot.pack(fill=tk.X, padx=20, pady=10)
+        ttk.Button(foot, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT)
+
+    # ── modifier helpers ──────────────────────────────────────────────
+    @staticmethod
+    def _mod_alt(state: int)   -> bool: return bool(state & 0x20000)   # Windows Alt
+    @staticmethod
+    def _mod_shift(state: int) -> bool: return bool(state & 0x0001)
+    @staticmethod
+    def _mod_ctrl(state: int)  -> bool: return bool(state & 0x0004)
+
     def start_drag(self, event: tk.Event) -> None:
         state = self.current()
-        if state:
-            self.preview.focus_set()
-            self.drag_start = (event.x, event.y, state.offset_x, state.offset_y)
+        if not state:
+            return
+        self.preview.focus_set()
+        self.drag_start = (event.x, event.y, state.offset_x, state.offset_y, state.rotation)
 
     def stop_drag(self, _event: tk.Event) -> None:
         self.drag_start = None
@@ -1714,16 +3326,36 @@ class AutoRawGui(tk.Tk):
     def drag_preview(self, event: tk.Event) -> None:
         if not self.drag_start:
             return
-        start_x, start_y, base_x, base_y = self.drag_start
-        # Drag conversion should match the preview render size.
+        start_x, start_y, base_x, base_y, base_rot = self.drag_start
         scale_x = CANVAS_SIZE[0] / PREVIEW_SIZE[0]
         scale_y = CANVAS_SIZE[1] / PREVIEW_SIZE[1]
-        self.offset_x.set(base_x + (event.x - start_x) * scale_x)
-        self.offset_y.set(base_y + (event.y - start_y) * scale_y)
+        dx = (event.x - start_x) * scale_x
+        dy = (event.y - start_y) * scale_y
+
+        if self._mod_ctrl(event.state):
+            # Ctrl + drag → rotate (horizontal distance = degrees)
+            rot_delta = (event.x - start_x) * 40.0 / max(1, self.preview.winfo_width())
+            self.rotation.set(max(-20.0, min(20.0, base_rot + rot_delta)))
+        elif self._mod_alt(event.state):
+            # Alt + drag → X-axis only
+            self.offset_x.set(base_x + dx)
+            self.offset_y.set(base_y)
+        elif self._mod_shift(event.state):
+            # Shift + drag → Y-axis only
+            self.offset_x.set(base_x)
+            self.offset_y.set(base_y + dy)
+        else:
+            # Plain drag → free XY
+            self.offset_x.set(base_x + dx)
+            self.offset_y.set(base_y + dy)
         self.update_current()
 
     def mousewheel_zoom(self, event: tk.Event) -> None:
-        delta = 0.04 if event.delta > 0 else -0.04
+        # Alt + wheel → fine step (1%); plain wheel → normal step (4%)
+        if self._mod_alt(event.state):
+            delta = 0.01 if event.delta > 0 else -0.01
+        else:
+            delta = 0.04 if event.delta > 0 else -0.04
         self.zoom.set(max(0.5, min(ZOOM_MAX, self.zoom.get() + delta)))
         self.update_current()
 
@@ -1750,7 +3382,7 @@ class AutoRawGui(tk.Tk):
         state.zoom = 1.0
         state.rotation = 0.0
         state.thumb_cache = None
-        self.select_frame(self.selected_index)
+        self.select_frame(self.selected_index, save_previous=False)
 
     def reset_folder(self) -> None:
         for state in self.current_frames():
@@ -1759,7 +3391,7 @@ class AutoRawGui(tk.Tk):
             state.zoom = 1.0
             state.rotation = 0.0
             state.thumb_cache = None
-        self.select_frame(self.selected_index)
+        self.select_frame(self.selected_index, save_previous=False)
 
     def export_checked(self) -> None:
         self._save_controls_to_current()
@@ -1776,6 +3408,11 @@ class AutoRawGui(tk.Tk):
         use_droplets = bool(self.use_droplet_var.get())
         use_colorcor = bool(self.use_colorcor_var.get())
         self.set_progress(0, "Готовлю экспорт...")
+        n_folders = len(checked_folders)
+        self._send_zona(
+            f"🚀 <b>Экспорт запущен</b>\n"
+            f"Папок: {n_folders}"
+        )
         threading.Thread(target=self.export_worker, args=(token, checked_folders, use_droplets, use_colorcor), daemon=True).start()
 
     def export_worker(self, token: int, checked_folders: list[Path], use_droplets: bool, use_colorcor: bool) -> None:
@@ -1884,7 +3521,10 @@ class AutoRawGui(tk.Tk):
                     )
                     try:
                         before_stat = output_path.stat()
-                        result = subprocess.run([str(droplet_exe), str(output_path)], capture_output=True, text=True)
+                        result = subprocess.run(
+                            [str(droplet_exe), str(output_path)],
+                            **_SUBPROC_TEXT,
+                        )
                         stderr_text = (result.stderr or "").strip()
                         stdout_text = (result.stdout or "").strip()
 
@@ -1954,6 +3594,14 @@ class AutoRawGui(tk.Tk):
                     if droplet_processed:
                         msg += f"\nЧерез дроплеты обработано: {droplet_processed}"
                     messagebox.showinfo(APP_NAME, msg)
+                    # Zona notification
+                    zona_text = (
+                        f"✅ <b>Экспорт завершён</b>\n"
+                        f"Файлов: {exported}  |  Время: {elapsed:.1f} сек"
+                    )
+                    if droplet_processed:
+                        zona_text += f"\nДроплет: {droplet_processed}"
+                    self._send_zona(zona_text)
             elif kind == "warning":
                 _, token, text = event
                 if token == self.load_token:
@@ -1964,6 +3612,7 @@ class AutoRawGui(tk.Tk):
                     self.loading_frames = False
                     self.set_progress(0, "Ошибка")
                     messagebox.showerror(APP_NAME, text)
+                    self._send_zona(f"❌ <b>Ошибка экспорта</b>\n{text}")
 
         self.after(100, self.process_worker_events)
 
