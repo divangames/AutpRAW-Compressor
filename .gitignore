@@ -29,3 +29,8 @@ venv/
 .idea/
 Thumbs.db
 Desktop.ini
+
+# Локальные настройки и секреты Zona (не коммитить)
+/ui_config.json
+/src/zona/data.dat
+/zona/data.dat
