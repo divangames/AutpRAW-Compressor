@@ -2,5 +2,6 @@
   "theme": "system",
   "zona_chat_id": "",
   "zona_enabled": false,
-  "user_name": "Иван"
+  "user_name": "Иван",
+  "gitverse_token": ""
 }

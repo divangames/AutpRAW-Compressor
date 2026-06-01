@@ -2,6 +2,8 @@
 /dist/
 /build/_staging/
 /build/pyinstaller/
+/build/msi/
+/build/msix/work/
 *.spec.bak
 
 # Выходные данные обработки

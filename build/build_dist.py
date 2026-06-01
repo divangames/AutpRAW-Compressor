@@ -16,8 +16,11 @@ DIST_DIR = ROOT / "dist" / "AutoRAWCompressor"
 WORK_DIR = ROOT / "build" / "pyinstaller"
 STAGING = ROOT / "build" / "_staging"
 SPEC = ROOT / "build" / "AutoRAW.spec"
+CLI_SPEC = ROOT / "build" / "AutoRAW-CLI.spec"
 
-ASSET_DIRS = ("reference", "rules", "color", "assets")
+ASSET_DIRS = ("reference", "rules", "color", "assets", "droplets")
+# Не копировать в dist — нужны только при сборке MSIX / разработке.
+ASSET_IGNORE_NAMES = {"icon.psd", "setup.png", "installer_banner.png"}
 
 
 def ensure_pyinstaller() -> None:
@@ -57,21 +60,9 @@ def run_pyinstaller() -> Path:
         "PyInstaller",
         "--noconfirm",
         "--clean",
-        "--onefile",
-        "--console",
-        f"--paths={ROOT / 'src'}",
         f"--distpath={cli_staging}",
         f"--workpath={WORK_DIR / 'cli'}",
-        f"--specpath={WORK_DIR / 'cli'}",
-        "--name",
-        "AutoRAW-Crop",
-        "--hidden-import",
-        "PIL._tkinter_finder",
-        "--collect-all",
-        "PIL",
-        "--collect-all",
-        "numpy",
-        str(ROOT / "src" / "autoraw_crop.py"),
+        str(CLI_SPEC),
     ]
     print("Running CLI onefile:", " ".join(cli_cmd))
     subprocess.check_call(cli_cmd, cwd=ROOT)
@@ -83,6 +74,10 @@ def run_pyinstaller() -> Path:
     return built
 
 
+def _ignore_assets(_dir: str, names: list[str]) -> set[str]:
+    return {name for name in names if name in ASSET_IGNORE_NAMES or name.lower().endswith(".psd")}
+
+
 def copy_assets(target: Path) -> None:
     for folder in ASSET_DIRS:
         source = ROOT / folder
@@ -92,8 +87,16 @@ def copy_assets(target: Path) -> None:
         dest = target / folder
         if dest.exists():
             shutil.rmtree(dest)
-        shutil.copytree(source, dest)
+        ignore = _ignore_assets if folder == "assets" else None
+        shutil.copytree(source, dest, ignore=ignore)
         print(f"Copied {folder}/ -> {dest}")
+
+    changelog = ROOT / "CHANGELOG.md"
+    if changelog.is_file():
+        shutil.copy2(changelog, target / "CHANGELOG.md")
+        print(f"Copied CHANGELOG.md -> {target / 'CHANGELOG.md'}")
+    else:
+        print(f"Warning: missing {changelog}")
 
 
 def write_launchers(target: Path) -> None:
@@ -146,7 +149,8 @@ def write_launchers(target: Path) -> None:
                 "  AutoRAW-Crop.exe  — пакетная обработка (CLI)",
                 "  run_autocrop.bat  — пример CLI (папки test / output)",
                 "",
-                "Рядом с exe должны лежать папки reference и rules.",
+                "Рядом с exe должны лежать папки reference, rules, droplets.",
+                "CHANGELOG.md — история изменений (меню «Что изменилось»).",
                 "Папку AutoRAWCompressor можно переносить на любой диск.",
                 "",
             ]

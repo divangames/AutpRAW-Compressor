@@ -1,6 +1,6 @@
 # AutoRAW Compressor
 
-**Версия: 0.0.1.5.ProtoAlpha**
+**Версия: 0.0.1.6.ProtoAlpha**
 
 Прототип массового автокадрирования для съёмки кроссовок: распознаёт товар на светлом фоне, применяет правила посадки по номеру кадра и готовит план кропа для Photoshop. Есть CLI и GUI с ручной подстройкой и экспортом.
 
@@ -111,7 +111,34 @@ Compressor/
 build.bat build
 ```
 
-Результат: `dist\AutoRAWCompressor\` — `AutoRAW-GUI.exe`, `AutoRAW-Crop.exe`, `reference`, `rules`, `run_gui.bat`. Папку можно переносить на другой диск.
+Результат: `dist\AutoRAWCompressor\` — `AutoRAW-GUI.exe`, `AutoRAW-Crop.exe`, `reference`, `rules`, `droplets`, `CHANGELOG.md`, `run_gui.bat`. Папку можно переносить на другой диск.
+
+MSIX-пакет (установщик Windows 10/11):
+
+```text
+build.bat msix
+```
+
+Результат: `dist\AutoRAWCompressor-<версия>.msix` и рядом `dist\AutoRAWCompressor-<версия>-CHANGELOG.txt`. Требуется [Windows SDK](https://developer.microsoft.com/windows/downloads/windows-sdk/) (MakeAppx + SignTool):
+
+```text
+winget install Microsoft.WindowsSDK.10.0.22621
+```
+
+Первый запуск на новом ПК: от имени администратора `build\msix\install_cert.bat`, затем двойной клик по `.msix`.
+
+### Автообновление (portable / exe)
+
+1. В `ui_config.json` укажите `"gitverse_token": "…"` (или `GITVERSE_TOKEN` в окружении).
+2. Соберите ZIP для релиза и загрузите в [Releases](https://gitverse.ru/delbraun/AutoRAWCompressor/releases):
+
+```text
+python build\build_release_zip.py
+```
+
+3. В приложении: **Справка → Проверить обновление…** — скачивание, прогресс, распаковка в папку exe и перезапуск.
+
+Имя ZIP должно содержать версию, например `AutoRAWCompressor-0.0.1.6.ProtoAlpha.zip`. Настройки (`ui_config.json`, `zona/data.dat`) сохраняются.
 
 Зависимости сборки:
 
@@ -147,7 +174,7 @@ Remote: `gitverse` → `https://gitverse.ru/delbraun/AutoRAWCompressor.git`
 | `W` | `VERSION_PATCH` | Мелкие исправления и мелкие нововведения |
 | Codename | `VERSION_CODENAME` | Название сборки (`ProtoAlpha`, …) |
 
-Строка версии: `X.Y.Z.W.Codename` (сейчас **0.0.1.5.ProtoAlpha**).
+Строка версии: `X.Y.Z.W.Codename` (сейчас **0.0.1.6.ProtoAlpha**).
 
 Отображается в заголовке GUI, `--version` CLI, меню `build.bat` и `dist/README.txt` после сборки.
 

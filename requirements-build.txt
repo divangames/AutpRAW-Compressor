@@ -1,3 +1,6 @@
 Pillow>=10.0
 numpy>=1.26
 pyinstaller>=6.0
+
+# MSIX: Windows 10/11 SDK (makeappx + signtool) — ставится отдельно:
+# winget install Microsoft.WindowsSDK.10.0.22621

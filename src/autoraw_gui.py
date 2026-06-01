@@ -40,7 +40,14 @@ except Exception:
 from PIL import Image, ImageEnhance, ImageOps, ImageTk
 
 from app_paths import resource_path
-from version import APP_NAME, APP_TITLE
+from version import APP_NAME, APP_TITLE, version_string
+from updater import (
+    RELEASES_PAGE,
+    UpdateInfo,
+    can_self_update,
+    fetch_latest_update,
+    run_update,
+)
 from autoraw_crop import (
     CANVAS_SIZE,
     LAYOUT_RULES,
@@ -139,6 +146,49 @@ def _apply_palette(mode: str) -> None:
 
 
 _CONFIG_PATH = resource_path("ui_config.json")
+
+
+class JobControl:
+    """Пауза / отмена фоновой задачи и учёт времени без пауз."""
+
+    def __init__(self) -> None:
+        self.cancelled = False
+        self.paused = False
+        self._segment_start = 0.0
+        self._active_elapsed = 0.0
+
+    def reset(self) -> None:
+        self.cancelled = False
+        self.paused = False
+        self._segment_start = time.monotonic()
+        self._active_elapsed = 0.0
+
+    def pause(self) -> None:
+        if not self.paused and not self.cancelled:
+            self._active_elapsed += time.monotonic() - self._segment_start
+            self.paused = True
+
+    def resume(self) -> None:
+        if self.paused and not self.cancelled:
+            self.paused = False
+            self._segment_start = time.monotonic()
+
+    def cancel(self) -> None:
+        self.cancelled = True
+        self.paused = False
+
+    def wait_if_paused(self) -> None:
+        while self.paused and not self.cancelled:
+            time.sleep(0.08)
+
+    def active_elapsed(self) -> float:
+        if self.paused:
+            return self._active_elapsed
+        return self._active_elapsed + (time.monotonic() - self._segment_start)
+
+    def should_stop(self, token: int, current_token: int) -> bool:
+        self.wait_if_paused()
+        return self.cancelled or token != current_token
 
 
 def _load_zona_data() -> dict[str, str]:
@@ -611,6 +661,10 @@ class AutoRawGui(tk.Tk):
         self.drop_window: tk.Toplevel | None = None
         self._menu_popups: list[tk.Toplevel] = []
         self.thumb_btns: list[tk.Label] = []
+        self._export_job = JobControl()
+        self._export_running = False
+        self._export_token = 0
+        self._update_skipped_session: set[str] = set()
 
         # Theme – must be set before _build_ui() applies palette
         self._theme_choice: str = _load_theme_choice()
@@ -626,6 +680,7 @@ class AutoRawGui(tk.Tk):
         self.after(50, self._enable_drop_target)
         self.after(100, self.process_worker_events)
         self.after(500, self._start_sysmon)
+        self.after(2000, self._startup_update_check)
 
         if initial_folder:
             self.load_root(initial_folder)
@@ -803,6 +858,22 @@ class AutoRawGui(tk.Tk):
             background=[("active", FIG_ACCENT_H), ("pressed", "#2a6dbf")],
             lightcolor=[("active", FIG_ACCENT_H)],
             darkcolor= [("active", FIG_ACCENT_H)],
+        )
+        st.configure("Ghost.TButton",
+            background=FIG_PANEL,
+            foreground=FIG_TEXT2,
+            padding=(10, 5),
+            relief="flat",
+            borderwidth=1,
+            focuscolor="",
+            lightcolor=FIG_BORDER,
+            darkcolor=FIG_BORDER,
+        )
+        st.map("Ghost.TButton",
+            background=[("active", FIG_PANEL_L), ("pressed", FIG_PANEL_L)],
+            foreground=[("active", FIG_TEXT), ("pressed", FIG_TEXT)],
+            lightcolor=[("active", FIG_BORDER)],
+            darkcolor=[("active", FIG_BORDER)],
         )
 
         # ── Treeview — Win11 Explorer dark style ───────────────────
@@ -1396,19 +1467,50 @@ class AutoRawGui(tk.Tk):
         canvas.create_text(62, 13, text="ВКЛ" if enabled else "ВЫКЛ", fill=FIG_TEXT if enabled else FIG_TEXT2,
                            font=("Segoe UI", 8, "bold"), anchor=tk.W)
 
-    def _make_switch(self, parent: tk.Widget, variable: tk.BooleanVar, command) -> tk.Canvas:
-        canvas = tk.Canvas(parent, width=92, height=26, bg=FIG_PANEL, highlightthickness=0, bd=0, cursor="hand2")
-        self._draw_switch(canvas, bool(variable.get()))
+    def _draw_modern_switch(self, canvas: tk.Canvas, enabled: bool, *, hover: bool = False) -> None:
+        """Компактный переключатель в стиле Win11 / iOS."""
+        canvas.delete("all")
+        track_off = "#404040" if not hover else "#4a4a4a"
+        track_on = FIG_ACCENT_H if hover else FIG_ACCENT
+        track = track_on if enabled else track_off
+        outline = track_on if enabled else FIG_BORDER
+        self._rounded_rect(canvas, 1, 2, 45, 22, 11, fill=track, outline=outline, width=1)
+        knob_x = 33 if enabled else 13
+        canvas.create_oval(knob_x - 8, 4, knob_x + 8, 20, fill="#ffffff", outline="", tags="knob")
+        if enabled:
+            canvas.create_oval(knob_x - 7, 5, knob_x + 7, 19, fill="#ffffff", outline=FIG_ACCENT, width=1)
+
+    def _make_switch(
+        self,
+        parent: tk.Widget,
+        variable: tk.BooleanVar,
+        command,
+        *,
+        modern: bool = False,
+    ) -> tk.Canvas:
+        w, h = (46, 24) if modern else (92, 26)
+        canvas = tk.Canvas(parent, width=w, height=h, bg=FIG_PANEL, highlightthickness=0, bd=0, cursor="hand2")
+        canvas._hover = False  # type: ignore[attr-defined]
+
+        def redraw() -> None:
+            if modern:
+                self._draw_modern_switch(canvas, bool(variable.get()), hover=bool(canvas._hover))
+            else:
+                self._draw_switch(canvas, bool(variable.get()))
+
+        redraw()
 
         def toggle(_event: tk.Event | None = None) -> str:
             variable.set(not bool(variable.get()))
-            self._draw_switch(canvas, bool(variable.get()))
+            redraw()
             command()
             return "break"
 
         canvas.bind("<Button-1>", toggle)
         canvas.bind("<Return>", toggle)
         canvas.bind("<space>", toggle)
+        canvas.bind("<Enter>", lambda _e: (setattr(canvas, "_hover", True), redraw()))
+        canvas.bind("<Leave>", lambda _e: (setattr(canvas, "_hover", False), redraw()))
         canvas.configure(takefocus=1)
         return canvas
 
@@ -1484,7 +1586,24 @@ class AutoRawGui(tk.Tk):
         self.drop_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
 
         ttk.Button(bar_inner, text="📂", width=3, command=self.pick_folder).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(bar_inner, text="Экспорт", style="Accent.TButton", command=self.export_checked).pack(side=tk.LEFT, padx=(2, 12))
+
+        self._export_actions = tk.Frame(bar_inner, bg=FIG_PANEL)
+        self._export_actions.pack(side=tk.LEFT, padx=(2, 12))
+        self.export_action_btn = ttk.Button(
+            self._export_actions,
+            text="Экспорт",
+            style="Accent.TButton",
+            width=11,
+            command=self._on_export_action,
+        )
+        self.export_action_btn.pack(side=tk.LEFT)
+        self.export_cancel_btn = ttk.Button(
+            self._export_actions,
+            text="Отмена",
+            style="Ghost.TButton",
+            width=9,
+            command=self._cancel_export,
+        )
 
         # separator dot
         tk.Frame(bar_inner, bg=FIG_BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y, pady=4)
@@ -1695,8 +1814,10 @@ class AutoRawGui(tk.Tk):
         # switch + action buttons on the right
         cc_right = tk.Frame(cc_head, bg=FIG_PANEL)
         cc_right.pack(side=tk.RIGHT)
-        self.colorcor_switch = self._make_switch(cc_right, self.use_colorcor_var, self.on_colorcor_toggle)
-        self.colorcor_switch.pack(side=tk.LEFT, padx=(0, 12))
+        self.colorcor_switch = self._make_switch(
+            cc_right, self.use_colorcor_var, self.on_colorcor_toggle, modern=True
+        )
+        self.colorcor_switch.pack(side=tk.LEFT, padx=(0, 14))
         ttk.Button(cc_right, text="Сохранить",
                    command=self.save_color_settings).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(cc_right, text="Сбросить",
@@ -1714,13 +1835,54 @@ class AutoRawGui(tk.Tk):
         cc_row2.pack(fill=tk.X, pady=(4, 0))
 
         self._slider(cc_row1, "Контраст",    -100,  100,   self.update_current,
-                     "{:.0f}",  compact=True, existing_var=self.contrast_var)
+                     "{:.0f}",  compact=True, existing_var=self.contrast_var, editable=True)
         self._slider(cc_row1, "Тени",        -100,  100,   self.update_current,
-                     "{:.0f}",  compact=True, existing_var=self.shadows_var)
+                     "{:.0f}",  compact=True, existing_var=self.shadows_var, editable=True)
         self._slider(cc_row2, "Температура", 2000, 10000,  self.update_current,
-                     "{:.0f}K", compact=True, existing_var=self.temperature_var)
+                     "{:.0f}K", compact=True, existing_var=self.temperature_var, editable=True)
         self._slider(cc_row2, "Оттенок",     -100,  100,   self.update_current,
-                     "{:.0f}",  compact=True, existing_var=self.tint_var)
+                     "{:.0f}",  compact=True, existing_var=self.tint_var, editable=True)
+
+        self.after_idle(self._sync_export_ui)
+
+    def _on_export_action(self) -> None:
+        if self._export_running:
+            self._toggle_export_pause()
+        else:
+            self.export_checked()
+
+    def _sync_export_ui(self) -> None:
+        if not hasattr(self, "export_action_btn"):
+            return
+        if not self._export_running:
+            self.export_action_btn.config(text="Экспорт", style="Accent.TButton")
+            self.export_cancel_btn.pack_forget()
+            return
+        label = "Продолжить" if self._export_job.paused else "Пауза"
+        self.export_action_btn.config(text=label, style="Accent.TButton")
+        if not self.export_cancel_btn.winfo_ismapped():
+            self.export_cancel_btn.pack(side=tk.LEFT, padx=(6, 0))
+
+    def _toggle_export_pause(self) -> None:
+        if not self._export_running:
+            return
+        if self._export_job.paused:
+            self._export_job.resume()
+            self.set_progress(self.progress_var.get(), "Экспорт продолжен")
+        else:
+            self._export_job.pause()
+            self.set_progress(self.progress_var.get(), "Экспорт на паузе")
+        self._sync_export_ui()
+
+    def _cancel_export(self) -> None:
+        if not self._export_running:
+            return
+        self._export_job.cancel()
+        self.set_progress(self.progress_var.get(), "Отмена экспорта…")
+
+    def _set_export_controls(self, running: bool) -> None:
+        self._export_running = running
+        self._sync_export_ui()
 
     def _slider(
         self,
@@ -1732,16 +1894,19 @@ class AutoRawGui(tk.Tk):
         fmt: str = "{:.0f}",
         compact: bool = False,
         existing_var: tk.Variable | None = None,
+        editable: bool = False,
     ) -> tk.DoubleVar:
         """Canvas slider — thin track, accent fill, round thumb.
         compact=True → smaller (used for colour-correction row).
         existing_var → reuse an existing IntVar/DoubleVar instead of creating a new one.
+        editable=True → поле ввода числа справа от подписи.
         """
         TRACK_H  = 2 if compact else 3
         THUMB_R  = 5 if compact else 7
         CANVAS_H = 14 if compact else 20
         FONT_SZ  = 8 if compact else 9
         BG = FIG_PANEL
+        fmt_suffix = "K" if fmt.rstrip().endswith("K") else ""
 
         col = tk.Frame(parent, bg=BG)
         col.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 12 if compact else 16))
@@ -1751,12 +1916,64 @@ class AutoRawGui(tk.Tk):
         tk.Label(hdr, text=label, bg=BG, fg=FIG_TEXT2,
                  font=("Segoe UI", FONT_SZ)).pack(side=tk.LEFT)
         val_str = tk.StringVar()
-        tk.Label(hdr, textvariable=val_str, bg=BG, fg=FIG_ACCENT,
-                 font=("Segoe UI", FONT_SZ, "bold"),
-                 width=6 if compact else 7, anchor="e").pack(side=tk.RIGHT)
-
         var: tk.Variable = existing_var if existing_var is not None else tk.DoubleVar(value=0.0)
-        val_str.set(fmt.format(var.get()))
+        syncing: dict[str, bool] = {"entry": False}
+
+        def format_value() -> str:
+            return fmt.format(var.get())
+
+        val_str.set(format_value())
+
+        if editable:
+            value_entry = tk.Entry(
+                hdr,
+                textvariable=val_str,
+                width=7 if fmt_suffix else 5,
+                justify="right",
+                bg=FIG_INPUT,
+                fg=FIG_ACCENT,
+                insertbackground=FIG_ACCENT,
+                relief="flat",
+                highlightthickness=1,
+                highlightbackground=FIG_BORDER,
+                highlightcolor=FIG_ACCENT,
+                font=("Segoe UI", FONT_SZ, "bold"),
+            )
+            value_entry.pack(side=tk.RIGHT, ipady=1)
+
+            def parse_entry(text: str) -> float | None:
+                raw = text.strip().replace(",", ".")
+                if not raw:
+                    return None
+                if fmt_suffix and raw.upper().endswith(fmt_suffix.upper()):
+                    raw = raw[: -len(fmt_suffix)].strip()
+                try:
+                    return float(raw)
+                except ValueError:
+                    return None
+
+            def commit_entry(_event: tk.Event | None = None) -> None:
+                if syncing["entry"]:
+                    return
+                parsed = parse_entry(val_str.get())
+                if parsed is None:
+                    val_str.set(format_value())
+                    return
+                clamped = max(start, min(end, parsed))
+                if isinstance(var, tk.IntVar):
+                    var.set(int(round(clamped)))
+                else:
+                    var.set(clamped)
+                val_str.set(format_value())
+                command()
+
+            value_entry.bind("<Return>", commit_entry)
+            value_entry.bind("<FocusOut>", commit_entry)
+            value_entry.bind("<FocusIn>", lambda _e: value_entry.after_idle(lambda: value_entry.select_range(0, tk.END)))
+        else:
+            tk.Label(hdr, textvariable=val_str, bg=BG, fg=FIG_ACCENT,
+                     font=("Segoe UI", FONT_SZ, "bold"),
+                     width=6 if compact else 7, anchor="e").pack(side=tk.RIGHT)
 
         c = tk.Canvas(col, height=CANVAS_H, bg=BG,
                       highlightthickness=0, bd=0, cursor="hand2")
@@ -1800,14 +2017,17 @@ class AutoRawGui(tk.Tk):
             var.set(max(start, min(end, var.get() + delta)))
             command()
 
+        def _on_var_change(*_: object) -> None:
+            syncing["entry"] = True
+            val_str.set(format_value())
+            syncing["entry"] = False
+            c.after_idle(_redraw)
+
         c.bind("<Configure>",     _redraw)
         c.bind("<ButtonPress-1>", lambda e: _set(e.x))
         c.bind("<B1-Motion>",     lambda e: _set(e.x))
         c.bind("<MouseWheel>",    _on_scroll)
-        var.trace_add("write", lambda *_: (
-            val_str.set(fmt.format(var.get())),
-            c.after_idle(_redraw),
-        ))
+        var.trace_add("write", _on_var_change)
 
         return var  # type: ignore[return-value]
 
@@ -2434,7 +2654,11 @@ class AutoRawGui(tk.Tk):
 
     def on_colorcor_toggle(self) -> None:
         if hasattr(self, "colorcor_switch"):
-            self._draw_switch(self.colorcor_switch, bool(self.use_colorcor_var.get()))
+            self._draw_modern_switch(
+                self.colorcor_switch,
+                bool(self.use_colorcor_var.get()),
+                hover=bool(getattr(self.colorcor_switch, "_hover", False)),
+            )
         for folder_state in self.folder_states.values():
             if not folder_state.frames:
                 continue
@@ -3369,48 +3593,227 @@ AutoRAW Compressor — инструмент пакетной обработки 
 
     # ── Check updates ──────────────────────────────────────────────
 
-    def check_updates(self) -> None:
-        """Launch background update check, show progress then result."""
-        win = self._info_window(self, "Проверка обновлений…", 420, 140)
-        lbl = tk.Label(win, text="Подключаемся к репозиторию…",
-                       bg=FIG_BG, fg=FIG_TEXT2, font=("Segoe UI", 10))
-        lbl.pack(expand=True)
+    def _startup_update_check(self) -> None:
+        def _worker() -> None:
+            try:
+                info = fetch_latest_update()
+            except Exception:
+                return
+            if info is None or info.version in self._update_skipped_session:
+                return
+            self.after(0, lambda: self._prompt_startup_update(info))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _prompt_startup_update(self, info: UpdateInfo) -> None:
+        if info.version in self._update_skipped_session:
+            return
+        size_hint = f" ({info.size // (1024 * 1024)} МБ)" if info.size else ""
+        install = messagebox.askyesno(
+            "Доступно обновление",
+            f"Найдена новая версия {info.version}{size_hint}.\n"
+            f"Текущая: {version_string()}\n\n"
+            f"Установить сейчас?\n\n"
+            f"«Нет» — напомнить при следующем запуске программы.",
+            parent=self,
+        )
+        if install:
+            self._begin_update_install(info)
+        else:
+            self._update_skipped_session.add(info.version)
+
+    def _begin_update_install(self, info: UpdateInfo) -> None:
+        ok, reason = can_self_update()
+        if not ok:
+            messagebox.showinfo(
+                "Обновление",
+                f"Доступна версия {info.version}.\n\n{reason}\n\nСкачать: {RELEASES_PAGE}",
+                parent=self,
+            )
+            return
+
+        win = self._info_window(self, "Обновление", 480, 200)
+        win.resizable(False, False)
+
+        stage_var = tk.StringVar(value="Подготовка…")
+        tk.Label(win, textvariable=stage_var, bg=FIG_BG, fg=FIG_TEXT, font=("Segoe UI", 10)).pack(pady=(20, 8))
+        progress_var = tk.DoubleVar(value=0)
+        ttk.Progressbar(win, variable=progress_var, maximum=100, length=420).pack(pady=(0, 6))
+        detail_var = tk.StringVar(value="")
+        tk.Label(win, textvariable=detail_var, bg=FIG_BG, fg=FIG_TEXT2, font=("Segoe UI", 9)).pack()
+
+        def on_progress(stage_key: str, pct: float, detail: str) -> None:
+            labels = {
+                "download": "Скачивание обновления",
+                "extract": "Распаковка архива",
+                "apply": "Установка файлов",
+            }
+            label = labels.get(stage_key, "Обновление")
+
+            def _ui() -> None:
+                stage_var.set(label)
+                progress_var.set(max(0, min(100, pct)))
+                detail_var.set(detail)
+
+            self.after(0, _ui)
 
         def _worker() -> None:
-            import urllib.request, json as _json
-            from version import VERSION
-            result: str
             try:
-                url = (
-                    "https://gitverse.ru/api/v1/repos/"
-                    "delbraun/AutoRAWCompressor/releases/latest"
-                )
-                req = urllib.request.Request(
-                    url, headers={"Accept": "application/json", "User-Agent": "AutoRAWCompressor"}
-                )
-                with urllib.request.urlopen(req, timeout=6) as r:
-                    data = _json.loads(r.read())
-                latest = data.get("tag_name", "").lstrip("v")
-                current = VERSION.lstrip("v")
-                if latest and latest != current:
-                    result = f"Доступна новая версия: {latest}\n\nТекущая: {current}\n\nСкачать: gitverse.ru/delbraun/AutoRAWCompressor"
-                else:
-                    result = f"У вас последняя версия.\n\nТекущая: {current}"
-            except Exception as e:
-                result = f"Не удалось проверить обновления.\n\n{e}"
+                run_update(info, on_progress=on_progress)
+            except Exception as exc:
+                err = str(exc)
 
-            def _show() -> None:
+                def _fail() -> None:
+                    try:
+                        win.destroy()
+                    except Exception:
+                        pass
+                    messagebox.showerror("Обновление", err, parent=self)
+
+                self.after(0, _fail)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def check_updates(self) -> None:
+        """Проверка, скачивание и автоустановка обновления с GitVerse."""
+        win = self._info_window(self, "Обновление", 480, 200)
+        win.resizable(False, False)
+
+        tk.Label(
+            win,
+            text="Проверка обновлений",
+            bg=FIG_BG,
+            fg=FIG_TEXT,
+            font=("Segoe UI", 11, "bold"),
+        ).pack(pady=(16, 4))
+
+        stage_var = tk.StringVar(value="Подключаемся к GitVerse…")
+        tk.Label(win, textvariable=stage_var, bg=FIG_BG, fg=FIG_TEXT2, font=("Segoe UI", 10)).pack(pady=(0, 8))
+
+        progress_var = tk.DoubleVar(value=0)
+        bar = ttk.Progressbar(win, variable=progress_var, maximum=100, length=420)
+        bar.pack(pady=(0, 6))
+
+        detail_var = tk.StringVar(value="")
+        tk.Label(win, textvariable=detail_var, bg=FIG_BG, fg=FIG_TEXT2, font=("Segoe UI", 9)).pack()
+
+        btn_row = tk.Frame(win, bg=FIG_BG)
+        btn_row.pack(pady=(14, 10))
+        close_btn = ttk.Button(btn_row, text="Закрыть", command=win.destroy, state=tk.DISABLED)
+        close_btn.pack()
+
+        state: dict[str, object] = {"busy": True, "cancelled": False}
+
+        def set_ui(stage: str, pct: float, detail: str) -> None:
+            stage_var.set(stage)
+            progress_var.set(max(0, min(100, pct)))
+            detail_var.set(detail)
+
+        def enable_close() -> None:
+            state["busy"] = False
+            close_btn.config(state=tk.NORMAL)
+
+        def ask_yes_no(title: str, message: str) -> bool:
+            box: dict[str, bool | None] = {"value": None}
+            done = threading.Event()
+
+            def _ask() -> None:
                 try:
-                    win.destroy()
+                    win.grab_release()
                 except Exception:
                     pass
-                messagebox.showinfo("Проверка обновлений", result)
+                box["value"] = messagebox.askyesno(title, message, parent=self)
+                try:
+                    win.grab_set()
+                except Exception:
+                    pass
+                done.set()
 
+            self.after(0, _ask)
+            done.wait(timeout=300)
+            return bool(box["value"])
+
+        def on_progress(stage_key: str, pct: float, detail: str) -> None:
+            labels = {
+                "download": "Скачивание обновления",
+                "extract": "Распаковка архива",
+                "apply": "Установка файлов",
+            }
+            label = labels.get(stage_key, "Обновление")
+            self.after(0, lambda: set_ui(label, pct, detail))
+
+        def _worker() -> None:
             try:
-                self.after(0, _show)
-            except Exception:
-                pass
+                self.after(0, lambda: set_ui("Проверка обновлений", 0, "Запрос к GitVerse…"))
+                info = fetch_latest_update()
+                if info is None:
+                    self.after(
+                        0,
+                        lambda: set_ui(
+                            "Актуальная версия",
+                            100,
+                            f"Установлено: {version_string()}",
+                        ),
+                    )
+                    self.after(0, enable_close)
+                    return
 
+                ok, reason = can_self_update()
+                if not ok:
+                    self.after(
+                        0,
+                        lambda: set_ui(
+                            "Доступно обновление",
+                            0,
+                            f"{info.version} — {info.asset_name}\n{reason}",
+                        ),
+                    )
+                    self.after(
+                        0,
+                        lambda: messagebox.showinfo(
+                            "Обновление",
+                            f"Доступна версия {info.version}.\n\n{reason}\n\nСкачать: {RELEASES_PAGE}",
+                            parent=self,
+                        ),
+                    )
+                    self.after(0, enable_close)
+                    return
+
+                size_hint = f" ({info.size // (1024 * 1024)} МБ)" if info.size else ""
+                if ask_yes_no(
+                    "Доступно обновление",
+                    f"Найдена версия {info.version}{size_hint}.\n"
+                    f"Текущая: {version_string()}\n\n"
+                    f"Скачать и установить сейчас?\n"
+                    f"Приложение закроется и откроется снова после распаковки.",
+                ):
+                    try:
+                        win.destroy()
+                    except Exception:
+                        pass
+                    self._begin_update_install(info)
+                    return
+
+                self.after(0, lambda: set_ui("Отменено", 0, "Обновление не установлено."))
+                self.after(0, enable_close)
+                return
+
+            except Exception as exc:
+                err = str(exc)
+
+                def _fail() -> None:
+                    set_ui("Ошибка", 0, err)
+                    messagebox.showerror("Обновление", err, parent=self)
+                    enable_close()
+
+                self.after(0, _fail)
+
+        def _on_close() -> None:
+            if state["busy"]:
+                return
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", _on_close)
         threading.Thread(target=_worker, daemon=True).start()
 
     def show_hotkeys(self) -> None:
@@ -3589,6 +3992,9 @@ AutoRAW Compressor — инструмент пакетной обработки 
 
         self.load_token += 1
         token = self.load_token
+        self._export_token = token
+        self._export_job.reset()
+        self._set_export_controls(True)
         use_droplets = bool(self.use_droplet_var.get())
         use_colorcor = bool(self.use_colorcor_var.get())
         self.set_progress(0, "Готовлю экспорт...")
@@ -3602,6 +4008,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
     def export_worker(self, token: int, checked_folders: list[Path], use_droplets: bool, use_colorcor: bool) -> None:
         exported = 0
         droplet_processed = 0
+        job = self._export_job
         total_units = 0
         for folder in checked_folders:
             folder_state = self.folder_states.get(folder)
@@ -3619,13 +4026,21 @@ AutoRAW Compressor — инструмент пакетной обработки 
                     total_units += len([frame for frame in checked_frames if frame.frame in DROPLET_BY_FRAME])
         total_units = max(1, total_units)
         done_units = 0
-        start_time = time.monotonic()
         aspect = target_aspect(REFERENCE_DIR)
         exported_for_droplets: list[tuple[Path, str]] = []
 
+        def stop_now() -> bool:
+            return job.should_stop(token, self.load_token)
+
+        def report_progress(label: str) -> None:
+            active = job.active_elapsed()
+            eta = (active / max(1, done_units) * max(0, total_units - done_units)) if done_units else 0.0
+            pause_note = " · пауза" if job.paused else ""
+            self.worker_events.put(("progress", token, done_units, total_units, f"{label}{pause_note}", eta))
+
         for folder in checked_folders:
-            if token != self.load_token:
-                return
+            if stop_now():
+                break
 
             folder_state = self.folder_states.get(folder)
             if not folder_state:
@@ -3636,15 +4051,17 @@ AutoRAW Compressor — инструмент пакетной обработки 
                 loaded: list[tuple[Path, Image.Image]] = []
                 paths = direct_image_files(folder)[:8]
                 for path in paths:
-                    elapsed = time.monotonic() - start_time
-                    eta = (elapsed / max(1, done_units) * max(0, total_units - done_units)) if done_units else 0.0
-                    self.worker_events.put(("progress", token, done_units, total_units, f"Открываю {folder.name}\\{path.name}", eta))
+                    if stop_now():
+                        break
+                    report_progress(f"Открываю {folder.name}\\{path.name}")
                     try:
                         img = open_preview(path, max_side=WORKING_MAX_SIDE)
                         loaded.append((path, img))
                     except Exception as exc:
                         self.worker_events.put(("warning", token, f"Не удалось открыть {path.name}:\n{exc}"))
                     done_units += 1
+                if stop_now():
+                    break
                 frames = [
                     FrameState(
                         path=path,
@@ -3664,10 +4081,10 @@ AutoRAW Compressor — инструмент пакетной обработки 
             output_dir = folder / folder.name
             output_dir.mkdir(parents=True, exist_ok=True)
             for frame in checked_frames:
-                elapsed = time.monotonic() - start_time
-                eta = (elapsed / max(1, done_units) * max(0, total_units - done_units)) if done_units else 0.0
+                if stop_now():
+                    break
                 export_name = export_name_for_frame(frame)
-                self.worker_events.put(("progress", token, done_units, total_units, f"Экспорт {folder.name}\\{export_name}", eta))
+                report_progress(f"Экспорт {folder.name}\\{export_name}")
                 # Экспорт в том же разрешении, что и редактор — иначе crop_box и смещения расходятся.
                 export_image = frame.image
                 export_crop = frame.crop_box
@@ -3692,8 +4109,10 @@ AutoRAW Compressor — инструмент пакетной обработки 
                 exported_for_droplets.append((output_path, frame.frame))
                 exported += 1
                 done_units += 1
+            if stop_now():
+                break
 
-        if use_droplets and exported_for_droplets:
+        if not stop_now() and use_droplets and exported_for_droplets:
             grouped: dict[str, list[Path]] = {}
             for output_path, frame in exported_for_droplets:
                 droplet_name = DROPLET_BY_FRAME.get(frame)
@@ -3707,13 +4126,9 @@ AutoRAW Compressor — инструмент пакетной обработки 
                     self.worker_events.put(("warning", token, f"Дроплет не найден:\n{droplet_exe}"))
                     continue
                 for output_path in paths:
-                    if token != self.load_token:
-                        return
-                    elapsed = time.monotonic() - start_time
-                    eta = (elapsed / max(1, done_units) * max(0, total_units - done_units)) if done_units else 0.0
-                    self.worker_events.put(
-                        ("progress", token, done_units, total_units, f"Дроплет {droplet_name}: {output_path.name}", eta)
-                    )
+                    if stop_now():
+                        break
+                    report_progress(f"Дроплет {droplet_name}: {output_path.name}")
                     try:
                         before_stat = output_path.stat()
                         result = subprocess.run(
@@ -3749,9 +4164,12 @@ AutoRAW Compressor — инструмент пакетной обработки 
                         )
                     droplet_processed += 1
                     done_units += 1
+                if stop_now():
+                    break
 
-        elapsed = time.monotonic() - start_time
-        self.worker_events.put(("export_done", token, exported, droplet_processed, elapsed))
+        active_elapsed = job.active_elapsed()
+        cancelled = job.cancelled
+        self.worker_events.put(("export_done", token, exported, droplet_processed, active_elapsed, cancelled))
 
     def set_progress(self, value: float, text: str) -> None:
         self.progress_var.set(max(0, min(100, value)))
@@ -3778,25 +4196,28 @@ AutoRAW Compressor — инструмент пакетной обработки 
                     eta_text = f", осталось ~{eta:.0f} сек" if eta else ""
                     self.set_progress(percent, f"{label} ({done}/{total}{eta_text})")
             elif kind == "export_done":
-                _, token, exported, droplet_processed, elapsed = event
-                if token == self.load_token:
-                    info = f"Экспорт готов: {exported} файлов за {elapsed:.1f} сек"
-                    if droplet_processed:
-                        info += f" (дроплет: {droplet_processed})"
-                    self.set_progress(100, info)
-                    self.render_thumbnails()
-                    msg = f"Экспорт готов. Файлов: {exported}"
-                    if droplet_processed:
-                        msg += f"\nЧерез дроплеты обработано: {droplet_processed}"
-                    messagebox.showinfo(APP_NAME, msg)
-                    # Zona notification
-                    zona_text = (
-                        f"✅ <b>Экспорт завершён</b>\n"
-                        f"Файлов: {exported}  |  Время: {elapsed:.1f} сек"
-                    )
-                    if droplet_processed:
-                        zona_text += f"\nДроплет: {droplet_processed}"
-                    self._send_zona(zona_text)
+                _, token, exported, droplet_processed, active_elapsed, cancelled = event
+                if token != getattr(self, "_export_token", token):
+                    continue
+                self._set_export_controls(False)
+                if cancelled:
+                    info = f"Экспорт отменён: {exported} файлов, рабочее время {active_elapsed:.1f} сек"
+                    msg = f"Экспорт отменён.\nФайлов успело сохраниться: {exported}\nРабочее время: {active_elapsed:.1f} сек (без пауз)"
+                    zona_title = "⏹ <b>Экспорт отменён</b>"
+                else:
+                    info = f"Экспорт готов: {exported} файлов, рабочее время {active_elapsed:.1f} сек"
+                    msg = f"Экспорт готов.\nФайлов: {exported}\nРабочее время: {active_elapsed:.1f} сек (без пауз)"
+                    zona_title = "✅ <b>Экспорт завершён</b>"
+                if droplet_processed:
+                    info += f" (дроплет: {droplet_processed})"
+                    msg += f"\nЧерез дроплеты обработано: {droplet_processed}"
+                self.set_progress(100 if not cancelled else self.progress_var.get(), info)
+                self.render_thumbnails()
+                messagebox.showinfo(APP_NAME, msg)
+                zona_text = f"{zona_title}\nФайлов: {exported}  |  Рабочее время: {active_elapsed:.1f} сек"
+                if droplet_processed:
+                    zona_text += f"\nДроплет: {droplet_processed}"
+                self._send_zona(zona_text)
             elif kind == "warning":
                 _, token, text = event
                 if token == self.load_token:
