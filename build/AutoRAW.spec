@@ -36,7 +36,6 @@ _excludes = [
     "pytest",
     "setuptools",
     "pkg_resources",
-    "distutils",
 ]
 
 a = Analysis(
