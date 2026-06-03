@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from app_paths import app_root, ensure_ui_config, resource_path, ui_config_path
+from app_paths import app_root, ensure_ui_config, ui_config_path, user_config_dir
 from version import VERSION, version_string
 
 GITVERSE_OWNER = "delbraun"
@@ -39,17 +39,14 @@ class UpdateInfo:
     size: int
 
 
-def _config_path() -> Path:
-    return ui_config_path()
-
-
 def gitverse_token_missing_message() -> str:
     ensure_ui_config()
-    cfg = _config_path()
+    cfg = ui_config_path()
     return (
-        f"Файл настроек:\n{cfg}\n\n"
+        f"Файл настроек (сохраняется между обновлениями):\n{cfg}\n\n"
         'Добавьте строку:\n  "gitverse_token": "ваш_токен"\n\n'
         "Или задайте переменную GITVERSE_TOKEN.\n"
+        "Токен нужен только для скачивания ZIP. Проверка релизов часто работает без токена.\n"
         "Токен: GitVerse → Настройки → Управление токенами → Публичное API."
     )
 
@@ -58,8 +55,9 @@ def gitverse_token() -> str:
     token = os.environ.get("GITVERSE_TOKEN", "").strip()
     if token:
         return token
+    ensure_ui_config()
     try:
-        cfg = json.loads(_config_path().read_text(encoding="utf-8"))
+        cfg = json.loads(ui_config_path().read_text(encoding="utf-8"))
         return str(cfg.get("gitverse_token", "")).strip()
     except Exception:
         return ""
@@ -164,24 +162,36 @@ def _version_from_release(release: dict, asset: dict | None) -> str:
     return tag or str(release.get("name") or "unknown")
 
 
-def fetch_latest_update(token: str | None = None) -> UpdateInfo | None:
-    token = (token or gitverse_token()).strip()
-    if not token:
-        raise RuntimeError(gitverse_token_missing_message())
-
+def _fetch_releases_json(token: str) -> list:
     url = f"{API_RELEASES}?page=1&per_page=10"
-    req = urllib.request.Request(url, headers=_api_headers(token))
+    headers = _api_headers(token) if token else {
+        "Accept": "application/vnd.gitverse.object+json;version=1",
+        "User-Agent": "AutoRAWCompressor",
+    }
+    req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
-            raise RuntimeError("GitVerse: неверный или просроченный токен (401).") from exc
+            if token:
+                raise RuntimeError("GitVerse: неверный или просроченный токен (401).") from exc
+            raise RuntimeError("GitVerse: для проверки обновлений нужен токен (401).") from exc
         if exc.code == 403:
             raise RuntimeError("GitVerse: доступ запрещён (403). Проверьте права токена.") from exc
         raise RuntimeError(f"GitVerse API: HTTP {exc.code}") from exc
+    return data if isinstance(data, list) else data.get("releases") or data.get("items") or []
 
-    releases = data if isinstance(data, list) else data.get("releases") or data.get("items") or []
+
+def fetch_latest_update(token: str | None = None) -> UpdateInfo | None:
+    token = (token or gitverse_token()).strip()
+    releases: list = []
+    try:
+        releases = _fetch_releases_json("")
+    except RuntimeError:
+        if not token:
+            raise RuntimeError(gitverse_token_missing_message())
+        releases = _fetch_releases_json(token)
     if not releases:
         return None
 
@@ -375,7 +385,7 @@ def extract_zip(zip_path: Path, dest_dir: Path, on_progress: ProgressCallback | 
 
 
 def _write_apply_script(*, stage_dir: Path, target_dir: Path, pid: int, exe_name: str) -> Path:
-    script = target_dir / "_apply_update.bat"
+    script = user_config_dir() / "apply_update.bat"
     log_path = target_dir / "_update_cache" / "apply.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     stage = str(stage_dir.resolve())
@@ -402,7 +412,7 @@ echo [%date% %time%] app exited>>"%LOG%"
 
 if exist "%TARGET%\\zona\\data.dat" copy /Y "%TARGET%\\zona\\data.dat" "%TEMP%\\autoraw_data.dat.bak" >nul
 
-robocopy "%STAGE%" "%TARGET%" /E /XD "_update_cache" /XF "ui_config.json" "_apply_update.bat" /IS /IT /R:5 /W:2 /NFL /NDL /NJH /NJS >>"%LOG%" 2>&1
+robocopy "%STAGE%" "%TARGET%" /E /XD "_update_cache" /XF "ui_config.json" /IS /IT /R:5 /W:2 /NFL /NDL /NJH /NJS >>"%LOG%" 2>&1
 set "RC=%ERRORLEVEL%"
 echo [%date% %time%] robocopy exit %RC%>>"%LOG%"
 if %RC% GEQ 8 exit /b %RC%

@@ -40,7 +40,7 @@ except Exception:
 
 from PIL import Image, ImageEnhance, ImageOps, ImageTk
 
-from app_paths import ensure_ui_config, resource_path
+from app_paths import ensure_ui_config, resource_path, ui_config_path
 from version import APP_NAME, APP_TITLE, version_string
 from updater import (
     RELEASES_PAGE,
@@ -48,6 +48,7 @@ from updater import (
     can_self_update,
     fetch_latest_update,
     gitverse_token_missing_message,
+    gitverse_token,
     run_update,
 )
 from autoraw_crop import (
@@ -151,9 +152,6 @@ def _apply_palette(mode: str) -> None:
     _DARK_MODE  = (mode == "dark")
 
 
-_CONFIG_PATH = resource_path("ui_config.json")
-
-
 class JobControl:
     """Пауза / отмена фоновой задачи и учёт времени без пауз."""
 
@@ -223,15 +221,20 @@ def _load_zona_data() -> dict[str, str]:
 
 
 def _load_config() -> dict:
+    ensure_ui_config()
     try:
-        return json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
+        return json.loads(ui_config_path().read_text(encoding="utf-8"))
     except Exception:
         return {}
 
 
 def _save_config(data: dict) -> None:
+    ensure_ui_config()
     try:
-        _CONFIG_PATH.write_text(json.dumps(data), encoding="utf-8")
+        ui_config_path().write_text(
+            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     except Exception:
         pass
 
@@ -2311,9 +2314,9 @@ class AutoRawGui(tk.Tk):
             ensure_ui_config()
             try:
                 if sys.platform == "win32":
-                    os.startfile(_CONFIG_PATH)  # noqa: S606
+                    os.startfile(str(ui_config_path()))  # noqa: S606
                 else:
-                    subprocess.run(["xdg-open", str(_CONFIG_PATH.parent)], check=False)
+                    subprocess.run(["xdg-open", str(ui_config_path().parent)], check=False)
             except Exception:
                 pass
 
@@ -2331,7 +2334,15 @@ class AutoRawGui(tk.Tk):
 
     def _is_gitverse_token_error(self, err: str) -> bool:
         low = err.lower()
-        return "токен" in low and "gitverse" in low
+        return ("токен" in low and "gitverse" in low) or (
+            "401" in low and "gitverse" in low and not gitverse_token().strip()
+        )
+
+    def _require_gitverse_token_for_download(self) -> bool:
+        if gitverse_token().strip():
+            return True
+        self._show_gitverse_token_toast()
+        return False
 
     def _show_export_success_toast(
         self,
@@ -3636,6 +3647,8 @@ class AutoRawGui(tk.Tk):
 
             def install() -> None:
                 self._close_banner_toast()
+                if not self._require_gitverse_token_for_download():
+                    return
                 self._clear_pending_update()
                 self._begin_update_install(info)
 
@@ -4331,6 +4344,8 @@ AutoRAW Compressor — инструмент пакетной обработки 
 
         def install() -> None:
             self._close_banner_toast()
+            if not self._require_gitverse_token_for_download():
+                return
             self._clear_pending_update()
             self._begin_update_install(info)
 
@@ -4466,6 +4481,8 @@ AutoRAW Compressor — инструмент пакетной обработки 
             close_btn.pack_forget()
 
             def on_install() -> None:
+                if not self._require_gitverse_token_for_download():
+                    return
                 choice["install"] = True
                 self._clear_pending_update()
                 choice_event.set()

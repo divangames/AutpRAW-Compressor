@@ -9,6 +9,7 @@ block_cipher = None
 
 ROOT = Path(SPECPATH).resolve().parent
 SRC = ROOT / "src"
+_VERSION_INFO = ROOT / "build" / "version_info.txt"
 
 # PIL: скрытые импорты
 _pil_hidden = ["PIL._tkinter_finder", *collect_submodules("PIL")]
@@ -76,6 +77,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=str(_icon) if _icon.is_file() else None,
+    version=str(_VERSION_INFO) if _VERSION_INFO.is_file() else None,
 )
 
 coll = COLLECT(

@@ -13,7 +13,7 @@ from __future__ import annotations
 VERSION_MAJOR = 0
 VERSION_SEMI = 0
 VERSION_FEATURE = 1
-VERSION_PATCH = 10
+VERSION_PATCH = 11
 VERSION_CODENAME = "ProtoAlpha"
 
 APP_NAME = "AutoRAW Compressor"
