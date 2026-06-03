@@ -20,6 +20,9 @@ from version import VERSION, version_string
 
 GITVERSE_OWNER = "delbraun"
 GITVERSE_REPO = "AutoRAWCompressor"
+GENERIC_PACKAGE = "AutoRAWCompressor"
+# GitVerse Releases API принимает ассеты только до ~3 MB; полный ZIP — в Generic Packages.
+MIN_RELEASE_ASSET_BYTES = 4 * 1024 * 1024
 RELEASES_PAGE = f"https://gitverse.ru/{GITVERSE_OWNER}/{GITVERSE_REPO}/releases"
 API_RELEASES = f"https://api.gitverse.ru/repos/{GITVERSE_OWNER}/{GITVERSE_REPO}/releases"
 
@@ -70,6 +73,31 @@ def _api_headers(token: str) -> dict[str, str]:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return headers
+
+
+def _package_asset_name(version: str) -> str:
+    return f"AutoRAWCompressor-{version.replace(' ', '_')}.zip"
+
+
+def _package_download_url(version: str) -> str:
+    name = _package_asset_name(version)
+    return (
+        f"https://gitverse.ru/api/packages/{GITVERSE_OWNER}/generic/"
+        f"{GENERIC_PACKAGE}/{version}/{name}"
+    )
+
+
+def _download_headers(token: str, url: str) -> dict[str, str]:
+    if "/api/packages/" in url and token:
+        import base64
+
+        basic = base64.b64encode(f"{GITVERSE_OWNER}:{token}".encode()).decode()
+        return {
+            "Accept": "*/*",
+            "User-Agent": "AutoRAWCompressor",
+            "Authorization": f"Basic {basic}",
+        }
+    return _api_headers(token)
 
 
 def parse_version(value: str) -> tuple[tuple[int, ...], str]:
@@ -162,20 +190,25 @@ def fetch_latest_update(token: str | None = None) -> UpdateInfo | None:
         if release.get("draft"):
             continue
         asset = _pick_zip_asset(release)
-        if not asset:
-            continue
         latest_ver = _version_from_release(release, asset)
         if not is_newer_version(latest_ver, current):
             continue
-        download_url = str(asset.get("browser_download_url") or asset.get("url") or "")
+        pkg_name = _package_asset_name(latest_ver)
+        asset_name = str(asset.get("name") or pkg_name) if asset else pkg_name
+        asset_size = int(asset.get("size") or 0) if asset else 0
+        download_url = str(asset.get("browser_download_url") or asset.get("url") or "") if asset else ""
+        if not download_url or asset_size < MIN_RELEASE_ASSET_BYTES:
+            download_url = _package_download_url(latest_ver)
+            asset_name = pkg_name
+            asset_size = 0
         if not download_url:
             continue
         return UpdateInfo(
             version=latest_ver,
             release_name=str(release.get("name") or latest_ver),
             download_url=download_url,
-            asset_name=str(asset.get("name") or "update.zip"),
-            size=int(asset.get("size") or 0),
+            asset_name=asset_name,
+            size=asset_size,
         )
     return None
 
@@ -217,7 +250,7 @@ def download_file(
     total_hint: int = 0,
 ) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    headers = _api_headers(token)
+    headers = _download_headers(token, url)
     req = urllib.request.Request(url, headers=headers)
 
     with urllib.request.urlopen(req, timeout=60) as resp:

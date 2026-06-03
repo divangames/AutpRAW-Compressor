@@ -15,6 +15,8 @@ from version import version_string  # noqa: E402
 
 DIST = ROOT / "dist" / "AutoRAWCompressor"
 OUT = ROOT / "dist"
+# CLI onefile (~33 MB) не нужен для автообновления GUI; уменьшает ZIP под лимит GitVerse (~50 MB).
+RELEASE_ZIP_SKIP = {"AutoRAW-Crop.exe"}
 
 
 def ensure_dist() -> None:
@@ -29,9 +31,9 @@ def build_zip() -> Path:
     out = OUT / f"AutoRAWCompressor-{slug}.zip"
     if out.exists():
         out.unlink()
-    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         for path in sorted(DIST.rglob("*")):
-            if path.is_file():
+            if path.is_file() and path.name not in RELEASE_ZIP_SKIP:
                 zf.write(path, path.relative_to(DIST).as_posix())
     size_mb = out.stat().st_size / (1024 * 1024)
     print(f"Release zip: {out} ({size_mb:.1f} MB)")

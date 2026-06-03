@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -17,7 +19,14 @@ sys.path.insert(0, str(BUILD))
 sys.path.insert(0, str(SRC))
 
 from installer_common import extract_version_changelog, safe_version_slug  # noqa: E402
-from updater import GITVERSE_OWNER, GITVERSE_REPO, _api_headers, gitverse_token  # noqa: E402
+from updater import (  # noqa: E402
+    GENERIC_PACKAGE,
+    GITVERSE_OWNER,
+    GITVERSE_REPO,
+    _api_headers,
+    _package_download_url,
+    gitverse_token,
+)
 from version import version_string  # noqa: E402
 
 API = f"https://api.gitverse.ru/repos/{GITVERSE_OWNER}/{GITVERSE_REPO}/releases"
@@ -90,11 +99,57 @@ def _delete_zip_assets(token: str, release_id: int) -> None:
         _request("DELETE", f"{API}/{release_id}/assets/{asset_id}", token)
 
 
-def _upload_zip(token: str, release_id: int, zip_path: Path) -> None:
-    upload_url = f"{API}/{release_id}/assets?name={zip_path.name}"
-    print(f"Uploading {zip_path.name} ({zip_path.stat().st_size / (1024 * 1024):.1f} MB)…")
-    form_body, ctype = _multipart_body({}, "attachment", zip_path)
-    _request("POST", upload_url, token, data=form_body, content_type=ctype)
+def _upload_generic_package(token: str, zip_path: Path, version: str) -> str:
+    """Загрузка ZIP в Generic Packages (без лимита ~3 MB у release assets)."""
+    name = zip_path.name
+    url = (
+        f"https://gitverse.ru/api/packages/{GITVERSE_OWNER}/generic/"
+        f"{GENERIC_PACKAGE}/{version}/{name}"
+    )
+    print(f"Package upload ({zip_path.stat().st_size / (1024 * 1024):.1f} MB)…")
+    proc = subprocess.run(
+        [
+            r"C:\Windows\System32\curl.exe",
+            "-fS",
+            "--user",
+            f"{GITVERSE_OWNER}:{token}",
+            "--upload-file",
+            str(zip_path),
+            url,
+            "-w",
+            "\nHTTP:%{http_code}\n",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Package upload failed ({proc.returncode}): {(proc.stderr or proc.stdout)[-400:]}"
+        )
+    return _package_download_url(version)
+
+
+def _release_body_with_package(changelog: str, package_url: str) -> str:
+    return (
+        f"{changelog.strip()}\n\n"
+        f"---\n\n"
+        f"**Скачать portable (ZIP):** Generic Package\n\n"
+        f"`{package_url}`\n\n"
+        f"Автообновление в приложении загружает архив из Generic Packages "
+        f"(лимит вложений Releases ~3 MB).\n"
+    )
+
+
+def _publish_package(token: str, zip_path: Path, version: str) -> str:
+    try:
+        return _upload_generic_package(token, zip_path, version)
+    except RuntimeError as exc:
+        if "409" in str(exc):
+            url = _package_download_url(version)
+            print(f"Package already exists, reusing: {url}")
+            return url
+        raise
 
 
 def main() -> int:
@@ -124,6 +179,8 @@ def main() -> int:
         return 1
 
     body_text = extract_version_changelog()
+    package_url = _publish_package(token, zip_path, version)
+    body_full = _release_body_with_package(body_text, package_url)
     existing = _find_release_by_tag(token, tag_name)
     do_update = args.update or (existing is not None and not args.create)
 
@@ -133,20 +190,20 @@ def main() -> int:
             return 1
         release_id = int(existing["id"])
         print(f"Updating release {tag_name} (id={release_id})…")
+        _delete_zip_assets(token, release_id)
         payload = json.dumps(
             {
                 "name": version,
-                "body": body_text,
+                "body": body_full,
                 "draft": False,
                 "prerelease": True,
             },
             ensure_ascii=False,
         ).encode("utf-8")
         _request("PATCH", f"{API}/{release_id}", token, data=payload, content_type="application/json")
-        _delete_zip_assets(token, release_id)
-        _upload_zip(token, release_id, zip_path)
         html = existing.get("html_url") or f"https://gitverse.ru/{GITVERSE_OWNER}/{GITVERSE_REPO}/releases/tag/{tag_name}"
         print(f"Release updated: {html}")
+        print(f"Package: {package_url}")
         return 0
 
     if existing is not None:
@@ -158,7 +215,7 @@ def main() -> int:
             "tag_name": tag_name,
             "target_commitish": "master",
             "name": version,
-            "body": body_text,
+            "body": body_full,
             "draft": False,
             "prerelease": True,
             "is_authorized_only": False,
@@ -172,13 +229,13 @@ def main() -> int:
     if not release_id:
         raise RuntimeError(f"Не получен id релиза: {release!r}")
 
-    _upload_zip(token, int(release_id), zip_path)
     html = (
         release.get("html_url")
         if isinstance(release, dict)
         else f"https://gitverse.ru/{GITVERSE_OWNER}/{GITVERSE_REPO}/releases/tag/{tag_name}"
     )
     print(f"Release published: {html}")
+    print(f"Package: {package_url}")
     return 0
 
 
