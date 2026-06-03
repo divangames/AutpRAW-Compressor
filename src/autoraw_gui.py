@@ -665,6 +665,12 @@ class AutoRawGui(tk.Tk):
         self._export_running = False
         self._export_token = 0
         self._update_skipped_session: set[str] = set()
+        self._pending_update: UpdateInfo | None = None
+        self._update_badge_timer: str | None = None
+        self._update_badge_on = False
+        self._banner_toast: tk.Toplevel | None = None
+        self._banner_toast_timer: str | None = None
+        self._banner_toast_photo: ImageTk.PhotoImage | None = None
 
         # Theme – must be set before _build_ui() applies palette
         self._theme_choice: str = _load_theme_choice()
@@ -1880,6 +1886,296 @@ class AutoRawGui(tk.Tk):
         self._export_job.cancel()
         self.set_progress(self.progress_var.get(), "Отмена экспорта…")
 
+    def _toast_workarea_xy(self, toast_w: int, toast_h: int, margin: int = 14) -> tuple[int, int]:
+        """Правый нижний угол рабочей области (над панелью задач)."""
+        if sys.platform == "win32":
+            try:
+                import ctypes
+
+                class _RECT(ctypes.Structure):
+                    _fields_ = [
+                        ("left", ctypes.c_long),
+                        ("top", ctypes.c_long),
+                        ("right", ctypes.c_long),
+                        ("bottom", ctypes.c_long),
+                    ]
+
+                rect = _RECT()
+                if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+                    x = rect.right - toast_w - margin
+                    y = rect.bottom - toast_h - margin
+                    return max(rect.left, x), max(rect.top, y)
+            except Exception:
+                pass
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        return sw - toast_w - margin, sh - toast_h - margin - 48
+
+    def _apply_toast_round_corners(
+        self,
+        win: tk.Toplevel,
+        toast_w: int,
+        toast_h: int,
+        radius: int = 14,
+    ) -> None:
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            gdi32 = ctypes.windll.gdi32
+            win.update_idletasks()
+            hwnd = user32.GetParent(win.winfo_id()) or win.winfo_id()
+            rgn = gdi32.CreateRoundRectRgn(0, 0, toast_w + 1, toast_h + 1, radius, radius)
+            user32.SetWindowRgn(hwnd, rgn, True)
+        except Exception:
+            pass
+
+    def _close_banner_toast(self) -> None:
+        if self._banner_toast_timer:
+            try:
+                self.after_cancel(self._banner_toast_timer)
+            except Exception:
+                pass
+            self._banner_toast_timer = None
+        if self._banner_toast is not None:
+            try:
+                self._banner_toast.destroy()
+            except Exception:
+                pass
+            self._banner_toast = None
+        self._banner_toast_photo = None
+
+    def _show_banner_toast(
+        self,
+        *,
+        banner_file: str,
+        title: str,
+        detail: str,
+        primary_text: str,
+        on_primary: Callable[[], None],
+        secondary_text: str | None = None,
+        on_secondary: Callable[[], None] | None = None,
+        fallback_icon: str = "✓",
+        auto_close_ms: int | None = 12000,
+    ) -> None:
+        """Toast в стиле системного уведомления с баннером из assets/image."""
+        self._close_banner_toast()
+
+        toast_w, hero_h = 380, 210
+        body_h = 176 if secondary_text else 148
+        toast_h = hero_h + body_h
+        margin = 14
+        corner_r = 14
+
+        win = tk.Toplevel(self)
+        win.overrideredirect(True)
+        win.configure(bg="#1a1a1a")
+        win.attributes("-topmost", True)
+        self._banner_toast = win
+
+        shell = tk.Frame(win, bg="#1a1a1a", bd=0, highlightthickness=0)
+        shell.pack(fill=tk.BOTH, expand=True)
+
+        hero = tk.Canvas(shell, width=toast_w, height=hero_h, highlightthickness=0, bd=0, cursor="arrow")
+        hero.pack(fill=tk.X)
+
+        banner_path = resource_path("assets", "image", banner_file)
+        if banner_path.is_file():
+            src = Image.open(banner_path).convert("RGBA")
+            fit = ImageOps.fit(src, (toast_w, hero_h), Image.Resampling.LANCZOS)
+            self._banner_toast_photo = ImageTk.PhotoImage(fit)
+            hero.create_image(0, 0, anchor=tk.NW, image=self._banner_toast_photo)
+        else:
+            hero.configure(bg=FIG_ACCENT)
+            hero.create_text(
+                toast_w // 2,
+                hero_h // 2,
+                text=fallback_icon,
+                fill="#ffffff",
+                font=("Segoe UI", 48, "bold"),
+            )
+
+        def _close(_event: tk.Event | None = None) -> None:
+            if on_secondary is not None:
+                on_secondary()
+            else:
+                self._close_banner_toast()
+
+        close_btn = tk.Label(
+            hero,
+            text="✕",
+            fg="#ffffff",
+            bg="#000000",
+            font=("Segoe UI", 10, "bold"),
+            padx=6,
+            pady=2,
+            cursor="hand2",
+        )
+        hero.create_window(toast_w - 14, 14, window=close_btn, anchor=tk.NE)
+        close_btn.bind("<Button-1>", _close)
+
+        body = tk.Frame(shell, bg="#1a1a1a", width=toast_w, height=body_h)
+        body.pack(fill=tk.BOTH, expand=True)
+        body.pack_propagate(False)
+
+        head = tk.Frame(body, bg="#1a1a1a")
+        head.pack(fill=tk.X, padx=16, pady=(14, 0))
+        tk.Label(
+            head,
+            text=APP_NAME,
+            bg="#1a1a1a",
+            fg=FIG_TEXT2,
+            font=("Segoe UI", 9),
+        ).pack(side=tk.LEFT)
+
+        tk.Label(
+            body,
+            text=title,
+            bg="#1a1a1a",
+            fg="#ffffff",
+            font=("Segoe UI", 13, "bold"),
+            anchor="w",
+        ).pack(fill=tk.X, padx=16, pady=(10, 4))
+
+        tk.Label(
+            body,
+            text=detail,
+            bg="#1a1a1a",
+            fg=FIG_TEXT2,
+            font=("Segoe UI", 10),
+            justify=tk.LEFT,
+            anchor="w",
+        ).pack(fill=tk.X, padx=16)
+
+        btn_row = tk.Frame(body, bg="#1a1a1a")
+        btn_row.pack(fill=tk.X, padx=16, pady=(10, 12))
+
+        def _primary(_event: tk.Event | None = None) -> None:
+            on_primary()
+
+        def _secondary(_event: tk.Event | None = None) -> None:
+            if on_secondary is not None:
+                on_secondary()
+
+        def _subtle_btn(
+            parent: tk.Frame,
+            text: str,
+            command: Callable[[], None],
+            *,
+            accent: bool = False,
+        ) -> tk.Label:
+            bg = "#252525" if accent else "#1a1a1a"
+            fg = "#d0d0d0" if accent else "#7a7a7a"
+            btn = tk.Label(
+                parent,
+                text=text,
+                bg=bg,
+                fg=fg,
+                font=("Segoe UI", 9),
+                padx=10,
+                pady=3,
+                cursor="hand2",
+            )
+            hover_bg = "#303030" if accent else "#222222"
+            hover_fg = "#ffffff" if accent else "#a8a8a8"
+
+            def _enter(_e: tk.Event) -> None:
+                btn.configure(bg=hover_bg, fg=hover_fg)
+
+            def _leave(_e: tk.Event) -> None:
+                btn.configure(bg=bg, fg=fg)
+
+            btn.bind("<Button-1>", lambda _e: command())
+            btn.bind("<Enter>", _enter)
+            btn.bind("<Leave>", _leave)
+            return btn
+
+        if secondary_text:
+            actions = tk.Frame(btn_row, bg="#1a1a1a")
+            actions.pack(anchor="w")
+            _subtle_btn(actions, primary_text, _primary, accent=True).pack(side=tk.LEFT, padx=(0, 8))
+            _subtle_btn(actions, secondary_text, _secondary).pack(side=tk.LEFT)
+        else:
+            _subtle_btn(btn_row, primary_text, _primary).pack(anchor="w")
+
+        self.update_idletasks()
+        x, y = self._toast_workarea_xy(toast_w, toast_h, margin)
+        win.geometry(f"{toast_w}x{toast_h}+{x}+{y}")
+        self.after(30, lambda: self._apply_toast_round_corners(win, toast_w, toast_h, corner_r))
+
+        if auto_close_ms is not None and secondary_text is None:
+            self._banner_toast_timer = self.after(auto_close_ms, self._close_banner_toast)
+
+    def _format_update_brief(self, info: UpdateInfo) -> str:
+        lines = [
+            f"Версия {info.version}",
+            f"Сейчас установлено: {version_string()}",
+        ]
+        if info.size:
+            lines.append(f"Размер: {info.size // (1024 * 1024)} МБ")
+        lines.append("После установки приложение перезапустится.")
+        return "\n".join(lines)
+
+    def _show_export_success_toast(
+        self,
+        exported: int,
+        active_elapsed: float,
+        droplet_processed: int,
+    ) -> None:
+        detail_lines = [
+            f"Экспортировано файлов: {exported}",
+            f"Рабочее время: {active_elapsed:.1f} сек (без пауз)",
+        ]
+        if droplet_processed:
+            detail_lines.append(f"Через дроплеты: {droplet_processed}")
+        self._show_banner_toast(
+            banner_file="MSG_Good.png",
+            title="Кадрирование завершено",
+            detail="\n".join(detail_lines),
+            primary_text="Отлично",
+            on_primary=self._close_banner_toast,
+        )
+
+    def _show_update_available_toast(
+        self,
+        info: UpdateInfo,
+        on_install: Callable[[], None],
+        on_later: Callable[[], None],
+    ) -> None:
+        self._show_banner_toast(
+            banner_file="MSG_Vers.png",
+            title="Доступно обновление",
+            detail=self._format_update_brief(info),
+            primary_text="Установить",
+            on_primary=on_install,
+            secondary_text="Позже",
+            on_secondary=on_later,
+            fallback_icon="↑",
+            auto_close_ms=None,
+        )
+
+    def _ask_update_via_toast(self, info: UpdateInfo) -> bool:
+        box: dict[str, bool | None] = {"value": None}
+        done = threading.Event()
+
+        def install() -> None:
+            box["value"] = True
+            self._close_banner_toast()
+            self._clear_pending_update()
+            done.set()
+
+        def later() -> None:
+            box["value"] = False
+            self._close_banner_toast()
+            self._mark_update_ignored(info)
+            done.set()
+
+        self.after(0, lambda: self._show_update_available_toast(info, install, later))
+        done.wait(timeout=300)
+        return bool(box["value"])
+
     def _set_export_controls(self, running: bool) -> None:
         self._export_running = running
         self._sync_export_ui()
@@ -2858,9 +3154,37 @@ class AutoRawGui(tk.Tk):
 
     def _build_sysbar(self, parent: tk.Frame) -> None:
         """Populate the system status bar widgets."""
-        def _sep() -> None:
+        def _sep(side: str = tk.LEFT) -> None:
             tk.Label(parent, text="│", bg=FIG_PANEL, fg=FIG_BORDER,
-                     font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=4)
+                     font=("Segoe UI", 9)).pack(side=side, padx=4)
+
+        # ── Version (right) ────────────────────────────────────────
+        ver_box = tk.Frame(parent, bg=FIG_PANEL)
+        ver_box.pack(side=tk.RIGHT, padx=(4, 10))
+
+        self._sysbar_version_var = tk.StringVar(value=version_string())
+        self._sysbar_version_lbl = tk.Label(
+            ver_box,
+            textvariable=self._sysbar_version_var,
+            bg=FIG_PANEL,
+            fg=FIG_TEXT2,
+            font=("Segoe UI", 8),
+            cursor="hand2",
+        )
+        self._sysbar_version_lbl.pack(side=tk.RIGHT)
+        self._sysbar_version_lbl.bind("<Button-1>", self._on_sysbar_version_click)
+
+        self._sysbar_update_badge = tk.Label(
+            ver_box,
+            text="⬆",
+            bg=FIG_PANEL,
+            fg=FIG_ACCENT,
+            font=("Segoe UI", 9, "bold"),
+            cursor="hand2",
+        )
+        self._sysbar_update_badge.bind("<Button-1>", self._on_sysbar_version_click)
+
+        _sep(tk.RIGHT)
 
         # ── User name ──────────────────────────────────────────────
         user_name = _load_config().get("user_name", "Иван")
@@ -2931,6 +3255,74 @@ class AutoRawGui(tk.Tk):
             bg=FIG_PANEL, fg=FIG_TEXT2, font=("Segoe UI", 8, "bold"), width=5,
         )
         self._sysbar_ram_lbl.pack(side=tk.LEFT)
+
+    def _stop_update_badge_pulse(self) -> None:
+        if self._update_badge_timer:
+            try:
+                self.after_cancel(self._update_badge_timer)
+            except Exception:
+                pass
+            self._update_badge_timer = None
+
+    def _pulse_update_badge(self) -> None:
+        if self._pending_update is None or not hasattr(self, "_sysbar_update_badge"):
+            return
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+        self._update_badge_on = not self._update_badge_on
+        color = "#fbbf24" if self._update_badge_on else FIG_ACCENT
+        self._sysbar_update_badge.configure(fg=color)
+        self._update_badge_timer = self.after(700, self._pulse_update_badge)
+
+    def _start_update_badge_pulse(self) -> None:
+        self._stop_update_badge_pulse()
+        self._update_badge_on = True
+        if hasattr(self, "_sysbar_update_badge"):
+            self._sysbar_update_badge.configure(fg=FIG_ACCENT)
+        self._pulse_update_badge()
+
+    def _refresh_sysbar_version(self) -> None:
+        if hasattr(self, "_sysbar_version_var"):
+            self._sysbar_version_var.set(version_string())
+        if not hasattr(self, "_sysbar_update_badge"):
+            return
+        if self._pending_update is not None:
+            self._sysbar_update_badge.pack(side=tk.RIGHT, padx=(0, 6))
+            self._sysbar_version_lbl.configure(fg=FIG_TEXT)
+            self._start_update_badge_pulse()
+        else:
+            self._sysbar_update_badge.pack_forget()
+            self._sysbar_version_lbl.configure(fg=FIG_TEXT2)
+            self._stop_update_badge_pulse()
+
+    def _mark_update_ignored(self, info: UpdateInfo) -> None:
+        self._update_skipped_session.add(info.version)
+        self._pending_update = info
+        self._refresh_sysbar_version()
+
+    def _clear_pending_update(self) -> None:
+        self._pending_update = None
+        self._refresh_sysbar_version()
+
+    def _on_sysbar_version_click(self, _event: tk.Event | None = None) -> None:
+        if self._pending_update is not None:
+            info = self._pending_update
+
+            def install() -> None:
+                self._close_banner_toast()
+                self._clear_pending_update()
+                self._begin_update_install(info)
+
+            def later() -> None:
+                self._close_banner_toast()
+                self._mark_update_ignored(info)
+
+            self._show_update_available_toast(info, install, later)
+        else:
+            self.check_updates()
 
     def _draw_signal_bars(self, bars: int, color: str) -> None:
         """Draw 5-bar WiFi-style signal indicator on the net canvas."""
@@ -3599,7 +3991,10 @@ AutoRAW Compressor — инструмент пакетной обработки 
                 info = fetch_latest_update()
             except Exception:
                 return
-            if info is None or info.version in self._update_skipped_session:
+            if info is None:
+                return
+            if info.version in self._update_skipped_session:
+                self.after(0, lambda: self._mark_update_ignored(info))
                 return
             self.after(0, lambda: self._prompt_startup_update(info))
 
@@ -3608,21 +4003,20 @@ AutoRAW Compressor — инструмент пакетной обработки 
     def _prompt_startup_update(self, info: UpdateInfo) -> None:
         if info.version in self._update_skipped_session:
             return
-        size_hint = f" ({info.size // (1024 * 1024)} МБ)" if info.size else ""
-        install = messagebox.askyesno(
-            "Доступно обновление",
-            f"Найдена новая версия {info.version}{size_hint}.\n"
-            f"Текущая: {version_string()}\n\n"
-            f"Установить сейчас?\n\n"
-            f"«Нет» — напомнить при следующем запуске программы.",
-            parent=self,
-        )
-        if install:
+
+        def install() -> None:
+            self._close_banner_toast()
+            self._clear_pending_update()
             self._begin_update_install(info)
-        else:
-            self._update_skipped_session.add(info.version)
+
+        def later() -> None:
+            self._close_banner_toast()
+            self._mark_update_ignored(info)
+
+        self._show_update_available_toast(info, install, later)
 
     def _begin_update_install(self, info: UpdateInfo) -> None:
+        self._clear_pending_update()
         ok, reason = can_self_update()
         if not ok:
             messagebox.showinfo(
@@ -3780,13 +4174,16 @@ AutoRAW Compressor — инструмент пакетной обработки 
                     return
 
                 size_hint = f" ({info.size // (1024 * 1024)} МБ)" if info.size else ""
-                if ask_yes_no(
-                    "Доступно обновление",
-                    f"Найдена версия {info.version}{size_hint}.\n"
-                    f"Текущая: {version_string()}\n\n"
-                    f"Скачать и установить сейчас?\n"
-                    f"Приложение закроется и откроется снова после распаковки.",
-                ):
+                self.after(
+                    0,
+                    lambda: set_ui(
+                        "Доступно обновление",
+                        0,
+                        f"Версия {info.version}{size_hint}",
+                    ),
+                )
+                if self._ask_update_via_toast(info):
+                    self._clear_pending_update()
                     try:
                         win.destroy()
                     except Exception:
@@ -4213,7 +4610,10 @@ AutoRAW Compressor — инструмент пакетной обработки 
                     msg += f"\nЧерез дроплеты обработано: {droplet_processed}"
                 self.set_progress(100 if not cancelled else self.progress_var.get(), info)
                 self.render_thumbnails()
-                messagebox.showinfo(APP_NAME, msg)
+                if cancelled:
+                    messagebox.showinfo(APP_NAME, msg)
+                else:
+                    self._show_export_success_toast(exported, active_elapsed, droplet_processed)
                 zona_text = f"{zona_title}\nФайлов: {exported}  |  Рабочее время: {active_elapsed:.1f} сек"
                 if droplet_processed:
                     zona_text += f"\nДроплет: {droplet_processed}"
