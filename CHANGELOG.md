@@ -2,6 +2,17 @@
 
 Формат версий: `X.Y.Z.W.Codename` — см. [`src/version.py`](src/version.py).
 
+## [0.0.1.12.ProtoAlpha] — 2026-05-29
+
+### Автообновление
+
+- Официальная portable-сборка скачивает обновления **без токена у пользователя**: read-only токен вшивается при сборке (`GITVERSE_READ_TOKEN`, не в git).
+- Убрана проверка токена при нажатии **Установить** в toast и диалоге обновления.
+
+### Сборка (maintainers)
+
+- `build/build_dist.py` записывает `src/builtin_gitverse_read_token.py` перед PyInstaller; модуль в `hiddenimports` spec.
+
 ## [0.0.1.11.ProtoAlpha] — 2026-05-29
 
 ### Автообновление и настройки

@@ -33,6 +33,7 @@ Thumbs.db
 Desktop.ini
 
 # Локальные настройки и секреты Zona (не коммитить)
+/src/builtin_gitverse_read_token.py
 /ui_config.json
 /src/zona/data.dat
 /zona/data.dat

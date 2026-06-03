@@ -39,15 +39,24 @@ class UpdateInfo:
     size: int
 
 
+def _builtin_read_token() -> str:
+    try:
+        from builtin_gitverse_read_token import BUILTIN_GITVERSE_READ_TOKEN
+
+        return str(BUILTIN_GITVERSE_READ_TOKEN or "").strip()
+    except ImportError:
+        return ""
+
+
 def gitverse_token_missing_message() -> str:
     ensure_ui_config()
     cfg = ui_config_path()
     return (
-        f"Файл настроек (сохраняется между обновлениями):\n{cfg}\n\n"
-        'Добавьте строку:\n  "gitverse_token": "ваш_токен"\n\n'
-        "Или задайте переменную GITVERSE_TOKEN.\n"
-        "Токен нужен только для скачивания ZIP. Проверка релизов часто работает без токена.\n"
-        "Токен: GitVerse → Настройки → Управление токенами → Публичное API."
+        "Не удалось скачать обновление.\n\n"
+        "Обычным пользователям токен не нужен — установите официальную сборку dist.\n"
+        "Для сборки из исходников задайте GITVERSE_READ_TOKEN при запуске build_dist.py.\n\n"
+        f"Опционально (разработчик): gitverse_token в\n{cfg}\n"
+        "или переменная GITVERSE_TOKEN."
     )
 
 
@@ -61,6 +70,11 @@ def gitverse_token() -> str:
         return str(cfg.get("gitverse_token", "")).strip()
     except Exception:
         return ""
+
+
+def gitverse_download_token() -> str:
+    """Токен для скачивания ZIP: свой пользовательский или встроенный read-only из сборки."""
+    return gitverse_token() or _builtin_read_token()
 
 
 def _api_headers(token: str) -> dict[str, str]:
@@ -184,14 +198,14 @@ def _fetch_releases_json(token: str) -> list:
 
 
 def fetch_latest_update(token: str | None = None) -> UpdateInfo | None:
-    token = (token or gitverse_token()).strip()
+    api_token = (token or gitverse_download_token()).strip()
     releases: list = []
     try:
         releases = _fetch_releases_json("")
     except RuntimeError:
-        if not token:
+        if not api_token:
             raise RuntimeError(gitverse_token_missing_message())
-        releases = _fetch_releases_json(token)
+        releases = _fetch_releases_json(api_token)
     if not releases:
         return None
 
@@ -312,7 +326,7 @@ def download_file(
     on_progress: ProgressCallback | None = None,
     total_hint: int = 0,
 ) -> None:
-    token = token.strip()
+    token = (token or gitverse_download_token()).strip()
     if not token:
         raise RuntimeError(gitverse_token_missing_message())
 
@@ -348,8 +362,8 @@ def download_file(
         except Exception as exc:
             if last_http is not None:
                 raise RuntimeError(
-                    "Не удалось скачать обновление (401). Проверьте gitverse_token в ui_config.json "
-                    "рядом с программой — токен GitVerse «Публичное API» с доступом к packages."
+                    "Не удалось скачать обновление (401). Установите официальную сборку dist "
+                    "или обновите приложение вручную с GitVerse Releases."
                 ) from exc
             raise
 
@@ -469,7 +483,7 @@ def run_update(
     if not ok:
         raise RuntimeError(reason)
 
-    token = (token or gitverse_token()).strip()
+    token = (token or gitverse_download_token()).strip()
     cache = app_root() / "_update_cache"
     if cache.exists():
         shutil.rmtree(cache, ignore_errors=True)

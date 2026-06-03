@@ -47,8 +47,8 @@ from updater import (
     UpdateInfo,
     can_self_update,
     fetch_latest_update,
+    gitverse_download_token,
     gitverse_token_missing_message,
-    gitverse_token,
     run_update,
 )
 from autoraw_crop import (
@@ -2333,16 +2333,12 @@ class AutoRawGui(tk.Tk):
         )
 
     def _is_gitverse_token_error(self, err: str) -> bool:
+        if gitverse_download_token().strip():
+            return False
         low = err.lower()
         return ("токен" in low and "gitverse" in low) or (
-            "401" in low and "gitverse" in low and not gitverse_token().strip()
+            "401" in low and "gitverse" in low
         )
-
-    def _require_gitverse_token_for_download(self) -> bool:
-        if gitverse_token().strip():
-            return True
-        self._show_gitverse_token_toast()
-        return False
 
     def _show_export_success_toast(
         self,
@@ -3647,8 +3643,6 @@ class AutoRawGui(tk.Tk):
 
             def install() -> None:
                 self._close_banner_toast()
-                if not self._require_gitverse_token_for_download():
-                    return
                 self._clear_pending_update()
                 self._begin_update_install(info)
 
@@ -4344,8 +4338,6 @@ AutoRAW Compressor — инструмент пакетной обработки 
 
         def install() -> None:
             self._close_banner_toast()
-            if not self._require_gitverse_token_for_download():
-                return
             self._clear_pending_update()
             self._begin_update_install(info)
 
@@ -4481,8 +4473,6 @@ AutoRAW Compressor — инструмент пакетной обработки 
             close_btn.pack_forget()
 
             def on_install() -> None:
-                if not self._require_gitverse_token_for_download():
-                    return
                 choice["install"] = True
                 self._clear_pending_update()
                 choice_event.set()

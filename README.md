@@ -1,6 +1,6 @@
 # AutoRAW Compressor
 
-**Версия: 0.0.1.11.ProtoAlpha**
+**Версия: 0.0.1.12.ProtoAlpha**
 
 Прототип массового автокадрирования для съёмки кроссовок: распознаёт товар на светлом фоне, применяет правила посадки по номеру кадра и готовит план кропа для Photoshop. Есть CLI и GUI с ручной подстройкой и экспортом.
 
@@ -129,19 +129,23 @@ winget install Microsoft.WindowsSDK.10.0.22621
 
 ### Автообновление (portable / exe)
 
-1. Токен GitVerse (нужен **только для скачивания** ZIP) — в файле  
-   `%LOCALAPPDATA%\AutoRAWCompressor\ui_config.json`  
-   (при первом запуске создаётся автоматически; токен из старого `ui_config.json` рядом с exe переносится).  
-   Альтернатива: переменная `GITVERSE_TOKEN`.
-2. Соберите ZIP для релиза и загрузите в [Releases](https://gitverse.ru/delbraun/AutoRAWCompressor/releases):
+**Пользователям** токен GitVerse не нужен: в официальной сборке read-only доступ к Generic Packages вшит при сборке.
+
+**Сборка релиза (maintainers):**
 
 ```text
+set GITVERSE_READ_TOKEN=<read-only token, только packages>
+python build\build_dist.py
 python build\build_release_zip.py
+python build\publish_gitverse_release.py
 ```
 
-3. В приложении: **Справка → Проверить обновление…** — скачивание, прогресс, распаковка в папку exe и перезапуск.
+`GITVERSE_READ_TOKEN` не коммитить; `src/builtin_gitverse_read_token.py` в `.gitignore`.  
+Опционально для разработки из исходников: `gitverse_token` в `%LOCALAPPDATA%\AutoRAWCompressor\ui_config.json` или `GITVERSE_TOKEN`.
 
-Имя ZIP должно содержать версию, например `AutoRAWCompressor-0.0.1.11.ProtoAlpha.zip`. Настройки пользователя и `zona/data.dat` при обновлении сохраняются.
+В приложении: **Справка → Проверить обновление…** — скачивание, прогресс, распаковка в папку exe и перезапуск.
+
+Имя ZIP: `AutoRAWCompressor-0.0.1.12.ProtoAlpha.zip`. Настройки пользователя и `zona/data.dat` при обновлении сохраняются.
 
 **Защитник Windows / SmartScreen:** неподписанный PyInstaller-exe и скрипт установки обновления могут вызывать предупреждение. Это ожидаемо: «Подробнее» → «Выполнить в любом случае», либо добавьте папку `AutoRAWCompressor` в исключения Защитника. Цифровая подпись exe планируется отдельно.
 
@@ -179,7 +183,7 @@ Remote: `gitverse` → `https://gitverse.ru/delbraun/AutoRAWCompressor.git`
 | `W` | `VERSION_PATCH` | Мелкие исправления и мелкие нововведения |
 | Codename | `VERSION_CODENAME` | Название сборки (`ProtoAlpha`, …) |
 
-Строка версии: `X.Y.Z.W.Codename` (сейчас **0.0.1.11.ProtoAlpha**).
+Строка версии: `X.Y.Z.W.Codename` (сейчас **0.0.1.12.ProtoAlpha**).
 
 Отображается в заголовке GUI, `--version` CLI, меню `build.bat` и `dist/README.txt` после сборки.
 

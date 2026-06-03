@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,30 @@ CLI_SPEC = ROOT / "build" / "AutoRAW-CLI.spec"
 ASSET_DIRS = ("reference", "rules", "color", "assets", "droplets")
 # Не копировать в dist — нужны только при сборке MSIX / разработке.
 ASSET_IGNORE_NAMES = {"icon.psd", "setup.png", "installer_banner.png"}
+BUILTIN_TOKEN_PATH = SRC / "builtin_gitverse_read_token.py"
+
+
+def write_builtin_gitverse_read_token() -> None:
+    """Вшивает read-only токен GitVerse в dist (не коммитить файл с реальным токеном)."""
+    token = os.environ.get("GITVERSE_READ_TOKEN", "").strip()
+    BUILTIN_TOKEN_PATH.write_text(
+        "\n".join(
+            [
+                '"""Read-only токен для автообновления. Перезаписывается при сборке (GITVERSE_READ_TOKEN)."""',
+                "",
+                f"BUILTIN_GITVERSE_READ_TOKEN = {token!r}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    if token:
+        print("builtin_gitverse_read_token.py: GITVERSE_READ_TOKEN записан (файл в .gitignore).")
+    else:
+        print(
+            "WARNING: GITVERSE_READ_TOKEN не задан — в собранном exe автообновление не скачает ZIP.\n"
+            "  Перед релизом: set GITVERSE_READ_TOKEN=<read-only packages token>"
+        )
 
 
 def ensure_pyinstaller() -> None:
@@ -203,6 +228,7 @@ def main() -> int:
             subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
 
     ensure_pyinstaller()
+    write_builtin_gitverse_read_token()
 
     if STAGING.exists():
         shutil.rmtree(STAGING)
