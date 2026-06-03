@@ -753,6 +753,7 @@ class AutoRawGui(tk.Tk):
         self._banner_toast: tk.Toplevel | None = None
         self._banner_toast_timer: str | None = None
         self._banner_toast_photo: ImageTk.PhotoImage | None = None
+        self._update_check_win: tk.Toplevel | None = None
 
         # Theme – must be set before _build_ui() applies palette
         self._theme_choice: str = _load_theme_choice()
@@ -2110,6 +2111,14 @@ class AutoRawGui(tk.Tk):
         except Exception:
             pass
 
+    def _close_update_check_win(self) -> None:
+        if self._update_check_win is not None:
+            try:
+                self._update_check_win.destroy()
+            except Exception:
+                pass
+            self._update_check_win = None
+
     def _close_banner_toast(self) -> None:
         if self._banner_toast_timer:
             try:
@@ -2361,26 +2370,6 @@ class AutoRawGui(tk.Tk):
             fallback_icon="↑",
             auto_close_ms=None,
         )
-
-    def _ask_update_via_toast(self, info: UpdateInfo) -> bool:
-        box: dict[str, bool | None] = {"value": None}
-        done = threading.Event()
-
-        def install() -> None:
-            box["value"] = True
-            self._close_banner_toast()
-            self._clear_pending_update()
-            done.set()
-
-        def later() -> None:
-            box["value"] = False
-            self._close_banner_toast()
-            self._mark_update_ignored(info)
-            done.set()
-
-        self.after(0, lambda: self._show_update_available_toast(info, install, later))
-        done.wait(timeout=300)
-        return bool(box["value"])
 
     def _set_export_controls(self, running: bool) -> None:
         self._export_running = running
@@ -4352,6 +4341,8 @@ AutoRAW Compressor — инструмент пакетной обработки 
         self._show_update_available_toast(info, install, later)
 
     def _begin_update_install(self, info: UpdateInfo) -> None:
+        self._close_banner_toast()
+        self._close_update_check_win()
         self._clear_pending_update()
         ok, reason = can_self_update()
         if not ok:
@@ -4364,6 +4355,8 @@ AutoRAW Compressor — инструмент пакетной обработки 
 
         win = self._info_window(self, "Обновление", 480, 200)
         win.resizable(False, False)
+        win.attributes("-topmost", True)
+        win.after(200, lambda: win.attributes("-topmost", False))
 
         stage_var = tk.StringVar(value="Подготовка…")
         tk.Label(win, textvariable=stage_var, bg=FIG_BG, fg=FIG_TEXT, font=("Segoe UI", 10)).pack(pady=(20, 8))
@@ -4406,7 +4399,10 @@ AutoRAW Compressor — инструмент пакетной обработки 
 
     def check_updates(self) -> None:
         """Проверка, скачивание и автоустановка обновления с GitVerse."""
-        win = self._info_window(self, "Обновление", 480, 200)
+        self._close_banner_toast()
+        self._close_update_check_win()
+        win = self._info_window(self, "Обновление", 480, 240)
+        self._update_check_win = win
         win.resizable(False, False)
 
         tk.Label(
@@ -4430,9 +4426,18 @@ AutoRAW Compressor — инструмент пакетной обработки 
         btn_row = tk.Frame(win, bg=FIG_BG)
         btn_row.pack(pady=(14, 10))
         close_btn = ttk.Button(btn_row, text="Закрыть", command=win.destroy, state=tk.DISABLED)
-        close_btn.pack()
+        close_btn.pack(side=tk.LEFT, padx=(0, 6))
+        install_btn = ttk.Button(
+            btn_row,
+            text="Установить",
+            style="Accent.TButton",
+            state=tk.DISABLED,
+        )
+        later_btn = ttk.Button(btn_row, text="Позже", state=tk.DISABLED)
 
         state: dict[str, object] = {"busy": True, "cancelled": False}
+        choice_event = threading.Event()
+        choice: dict[str, bool | None] = {"install": None}
 
         def set_ui(stage: str, pct: float, detail: str) -> None:
             stage_var.set(stage)
@@ -4443,25 +4448,31 @@ AutoRAW Compressor — инструмент пакетной обработки 
             state["busy"] = False
             close_btn.config(state=tk.NORMAL)
 
-        def ask_yes_no(title: str, message: str) -> bool:
-            box: dict[str, bool | None] = {"value": None}
-            done = threading.Event()
+        def show_install_actions(info: UpdateInfo) -> None:
+            state["busy"] = False
+            close_btn.pack_forget()
 
-            def _ask() -> None:
-                try:
-                    win.grab_release()
-                except Exception:
-                    pass
-                box["value"] = messagebox.askyesno(title, message, parent=self)
-                try:
-                    win.grab_set()
-                except Exception:
-                    pass
-                done.set()
+            def on_install() -> None:
+                choice["install"] = True
+                self._clear_pending_update()
+                choice_event.set()
+                self._close_update_check_win()
+                self._begin_update_install(info)
 
-            self.after(0, _ask)
-            done.wait(timeout=300)
-            return bool(box["value"])
+            def on_later() -> None:
+                choice["install"] = False
+                self._mark_update_ignored(info)
+                choice_event.set()
+                set_ui("Отменено", 0, "Обновление не установлено.")
+                install_btn.pack_forget()
+                later_btn.pack_forget()
+                close_btn.pack(side=tk.LEFT)
+                close_btn.config(state=tk.NORMAL)
+
+            install_btn.configure(command=on_install, state=tk.NORMAL)
+            later_btn.configure(command=on_later, state=tk.NORMAL)
+            install_btn.pack(side=tk.LEFT, padx=(0, 6))
+            later_btn.pack(side=tk.LEFT)
 
         def on_progress(stage_key: str, pct: float, detail: str) -> None:
             labels = {
@@ -4509,26 +4520,18 @@ AutoRAW Compressor — инструмент пакетной обработки 
                     self.after(0, enable_close)
                     return
 
-                size_hint = f" ({info.size // (1024 * 1024)} МБ)" if info.size else ""
+                size_hint = f" ({info.size // (1024 * 1024)} МБ)" if info.size else " (~40 МБ)"
                 self.after(
                     0,
                     lambda: set_ui(
                         "Доступно обновление",
                         0,
-                        f"Версия {info.version}{size_hint}",
+                        f"Версия {info.version}{size_hint}\n\n"
+                        f"Сейчас: {version_string()}",
                     ),
                 )
-                if self._ask_update_via_toast(info):
-                    self._clear_pending_update()
-                    try:
-                        win.destroy()
-                    except Exception:
-                        pass
-                    self._begin_update_install(info)
-                    return
-
-                self.after(0, lambda: set_ui("Отменено", 0, "Обновление не установлено."))
-                self.after(0, enable_close)
+                self.after(0, lambda: show_install_actions(info))
+                choice_event.wait(timeout=600)
                 return
 
             except Exception as exc:
@@ -4551,9 +4554,16 @@ AutoRAW Compressor — инструмент пакетной обработки 
         def _on_close() -> None:
             if state["busy"]:
                 return
+            self._update_check_win = None
             win.destroy()
 
+        def _on_destroy() -> None:
+            self._update_check_win = None
+            if not choice_event.is_set():
+                choice_event.set()
+
         win.protocol("WM_DELETE_WINDOW", _on_close)
+        win.bind("<Destroy>", lambda _e: _on_destroy(), add="+")
         threading.Thread(target=_worker, daemon=True).start()
 
     def show_hotkeys(self) -> None:

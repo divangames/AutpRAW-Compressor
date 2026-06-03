@@ -197,12 +197,11 @@ def fetch_latest_update(token: str | None = None) -> UpdateInfo | None:
         asset_name = str(asset.get("name") or pkg_name) if asset else pkg_name
         asset_size = int(asset.get("size") or 0) if asset else 0
         download_url = str(asset.get("browser_download_url") or asset.get("url") or "") if asset else ""
-        if not download_url or asset_size < MIN_RELEASE_ASSET_BYTES:
-            download_url = _package_download_url(latest_ver)
-            asset_name = pkg_name
+        # Portable ZIP всегда в Generic Packages (release-assets часто 401 или <3 MB).
+        download_url = _package_download_url(latest_ver)
+        asset_name = pkg_name
+        if asset_size < MIN_RELEASE_ASSET_BYTES:
             asset_size = 0
-        if not download_url:
-            continue
         return UpdateInfo(
             version=latest_ver,
             release_name=str(release.get("name") or latest_ver),
@@ -242,6 +241,60 @@ def _format_bytes(n: int) -> str:
     return f"{n} Б"
 
 
+def _download_stream(
+    resp: object,
+    dest: Path,
+    on_progress: ProgressCallback | None,
+    total_hint: int,
+) -> None:
+    total = int(getattr(resp, "headers", {}).get("Content-Length") or total_hint or 0)  # type: ignore[union-attr]
+    read = 0
+    chunk_size = 256 * 1024
+    with dest.open("wb") as out:
+        while True:
+            chunk = resp.read(chunk_size)  # type: ignore[union-attr]
+            if not chunk:
+                break
+            out.write(chunk)
+            read += len(chunk)
+            if on_progress:
+                if total > 0:
+                    pct = min(99.0, read * 100.0 / total)
+                    left = max(0, total - read)
+                    detail = (
+                        f"{_format_bytes(read)} / {_format_bytes(total)} · "
+                        f"осталось {_format_bytes(left)}"
+                    )
+                else:
+                    pct = 0.0
+                    detail = f"Скачано {_format_bytes(read)}"
+                on_progress("download", pct, detail)
+
+
+def _download_via_curl(url: str, dest: Path, token: str) -> None:
+    curl = Path(r"C:\Windows\System32\curl.exe")
+    if not curl.is_file():
+        raise RuntimeError("curl.exe не найден — не удалось скачать обновление.")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        [
+            str(curl),
+            "-fSL",
+            "--user",
+            f"{GITVERSE_OWNER}:{token}",
+            "-o",
+            str(dest),
+            url,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "")[-500:]
+        raise RuntimeError(f"curl: ошибка загрузки ({proc.returncode}): {tail}")
+
+
 def download_file(
     url: str,
     dest: Path,
@@ -249,33 +302,50 @@ def download_file(
     on_progress: ProgressCallback | None = None,
     total_hint: int = 0,
 ) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    headers = _download_headers(token, url)
-    req = urllib.request.Request(url, headers=headers)
+    token = token.strip()
+    if not token:
+        raise RuntimeError(gitverse_token_missing_message())
 
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        total = int(resp.headers.get("Content-Length") or total_hint or 0)
-        read = 0
-        chunk_size = 256 * 1024
-        with dest.open("wb") as out:
-            while True:
-                chunk = resp.read(chunk_size)
-                if not chunk:
-                    break
-                out.write(chunk)
-                read += len(chunk)
-                if on_progress:
-                    if total > 0:
-                        pct = min(99.0, read * 100.0 / total)
-                        left = max(0, total - read)
-                        detail = (
-                            f"{_format_bytes(read)} / {_format_bytes(total)} · "
-                            f"осталось {_format_bytes(left)}"
-                        )
-                    else:
-                        pct = 0.0
-                        detail = f"Скачано {_format_bytes(read)}"
-                    on_progress("download", pct, detail)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    header_attempts: list[dict[str, str] | None] = []
+    if "/api/packages/" in url:
+        header_attempts.extend([_api_headers(token), _download_headers(token, url), None])
+    else:
+        header_attempts.append(_api_headers(token))
+
+    last_http: urllib.error.HTTPError | None = None
+    for headers in header_attempts:
+        try:
+            req = urllib.request.Request(url, headers=headers or {})
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                _download_stream(resp, dest, on_progress, total_hint)
+            if on_progress:
+                on_progress("download", 100.0, "Загрузка завершена")
+            return
+        except urllib.error.HTTPError as exc:
+            last_http = exc
+            if exc.code not in (401, 403):
+                raise RuntimeError(f"Ошибка загрузки: HTTP {exc.code}") from exc
+
+    if sys.platform == "win32" and "/api/packages/" in url:
+        try:
+            if on_progress:
+                on_progress("download", 0.0, "Повтор через curl…")
+            _download_via_curl(url, dest, token)
+            if on_progress:
+                on_progress("download", 100.0, "Загрузка завершена")
+            return
+        except Exception as exc:
+            if last_http is not None:
+                raise RuntimeError(
+                    "Не удалось скачать обновление (401). Проверьте gitverse_token в ui_config.json "
+                    "рядом с программой — токен GitVerse «Публичное API» с доступом к packages."
+                ) from exc
+            raise
+
+    if last_http is not None:
+        raise RuntimeError(f"Ошибка загрузки: HTTP {last_http.code}") from last_http
+    raise RuntimeError("Не удалось скачать обновление.")
 
 
 def _resolve_zip_root(extracted: Path) -> Path:
