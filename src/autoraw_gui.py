@@ -4380,6 +4380,16 @@ AutoRAW Compressor — инструмент пакетной обработки 
 
             self.after(0, _ui)
 
+        def _finish_apply() -> None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            try:
+                self.quit()
+            except Exception:
+                pass
+
         def _worker() -> None:
             try:
                 run_update(info, on_progress=on_progress)
@@ -4394,6 +4404,9 @@ AutoRAW Compressor — инструмент пакетной обработки 
                     messagebox.showerror("Обновление", err, parent=self)
 
                 self.after(0, _fail)
+                return
+            # run_update завершает процесс через os._exit; на случай сбоя — закрыть окно.
+            self.after(0, _finish_apply)
 
         threading.Thread(target=_worker, daemon=True).start()
 

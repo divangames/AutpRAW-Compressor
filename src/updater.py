@@ -376,12 +376,21 @@ def extract_zip(zip_path: Path, dest_dir: Path, on_progress: ProgressCallback | 
 
 def _write_apply_script(*, stage_dir: Path, target_dir: Path, pid: int, exe_name: str) -> Path:
     script = target_dir / "_apply_update.bat"
+    log_path = target_dir / "_update_cache" / "apply.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    stage = str(stage_dir.resolve())
+    target = str(target_dir.resolve())
+    cache_parent = str(stage_dir.parent.resolve())
     # ui_config.json и секреты не перезаписываем
     content = f"""@echo off
 setlocal EnableExtensions
-set PID={pid}
-set STAGE={stage_dir}
-set TARGET={target_dir}
+set "PID={pid}"
+set "STAGE={stage}"
+set "TARGET={target}"
+set "LOG={log_path}"
+set "EXE={exe_name}"
+
+echo [%date% %time%] update start PID=%PID%>>"%LOG%"
 
 :wait_app
 tasklist /FI "PID eq %PID%" 2>nul | find "%PID%" >nul
@@ -389,22 +398,26 @@ if not errorlevel 1 (
     ping -n 2 127.0.0.1 >nul
     goto wait_app
 )
+echo [%date% %time%] app exited>>"%LOG%"
 
 if exist "%TARGET%\\zona\\data.dat" copy /Y "%TARGET%\\zona\\data.dat" "%TEMP%\\autoraw_data.dat.bak" >nul
 
-robocopy "%STAGE%" "%TARGET%" /E /XD "_update_cache" /XF "ui_config.json" "_apply_update.bat" /IS /IT /R:5 /W:2 /NFL /NDL /NJH /NJS
-if errorlevel 8 exit /b 1
+robocopy "%STAGE%" "%TARGET%" /E /XD "_update_cache" /XF "ui_config.json" "_apply_update.bat" /IS /IT /R:5 /W:2 /NFL /NDL /NJH /NJS >>"%LOG%" 2>&1
+set "RC=%ERRORLEVEL%"
+echo [%date% %time%] robocopy exit %RC%>>"%LOG%"
+if %RC% GEQ 8 exit /b %RC%
 
 if exist "%TEMP%\\autoraw_data.dat.bak" (
     if not exist "%TARGET%\\zona" mkdir "%TARGET%\\zona"
     copy /Y "%TEMP%\\autoraw_data.dat.bak" "%TARGET%\\zona\\data.dat" >nul
     del /f /q "%TEMP%\\autoraw_data.dat.bak" 2>nul
 )
-if exist "%TARGET%\\{exe_name}" (
-    start "" /D "%TARGET%" "%TARGET%\\{exe_name}"
+if exist "%TARGET%\\%EXE%" (
+    start "" /D "%TARGET%" "%TARGET%\\%EXE%"
+    echo [%date% %time%] restarted>>"%LOG%"
 )
 
-rd /s /q "{stage_dir.parent}" 2>nul
+rd /s /q "{cache_parent}" 2>nul
 del /f /q "%~f0" 2>nul
 exit /b 0
 """
@@ -413,6 +426,7 @@ exit /b 0
 
 
 def apply_update_and_restart(stage_dir: Path) -> None:
+    """Запускает фоновый bat и немедленно завершает процесс (иначе bat ждёт PID вечно)."""
     target = app_root()
     exe_name = Path(sys.executable).name
     pid = os.getpid()
@@ -422,14 +436,18 @@ def apply_update_and_restart(stage_dir: Path) -> None:
         pid=pid,
         exe_name=exe_name,
     )
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
     subprocess.Popen(
-        ["cmd", "/c", str(script)],
+        ["cmd.exe", "/c", str(script)],
         cwd=str(target),
-        creationflags=flags,
+        creationflags=creationflags,
         close_fds=True,
     )
-    sys.exit(0)
+    # sys.exit() из потока загрузки не закрывает Tk — процесс остаётся, bat висит на :wait_app.
+    os._exit(0)
 
 
 def run_update(
