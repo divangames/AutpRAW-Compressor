@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from app_paths import app_root, resource_path
+from app_paths import app_root, ensure_ui_config, resource_path, ui_config_path
 from version import VERSION, version_string
 
 GITVERSE_OWNER = "delbraun"
@@ -37,7 +37,18 @@ class UpdateInfo:
 
 
 def _config_path() -> Path:
-    return resource_path("ui_config.json")
+    return ui_config_path()
+
+
+def gitverse_token_missing_message() -> str:
+    ensure_ui_config()
+    cfg = _config_path()
+    return (
+        f"Файл настроек:\n{cfg}\n\n"
+        'Добавьте строку:\n  "gitverse_token": "ваш_токен"\n\n'
+        "Или задайте переменную GITVERSE_TOKEN.\n"
+        "Токен: GitVerse → Настройки → Управление токенами → Публичное API."
+    )
 
 
 def gitverse_token() -> str:
@@ -128,13 +139,7 @@ def _version_from_release(release: dict, asset: dict | None) -> str:
 def fetch_latest_update(token: str | None = None) -> UpdateInfo | None:
     token = (token or gitverse_token()).strip()
     if not token:
-        raise RuntimeError(
-            "Не задан токен GitVerse.\n\n"
-            "Добавьте в ui_config.json:\n"
-            '  "gitverse_token": "ваш_токен"\n\n'
-            "Или переменную окружения GITVERSE_TOKEN.\n"
-            "Токен: GitVerse → Настройки → Управление токенами → Публичное API."
-        )
+        raise RuntimeError(gitverse_token_missing_message())
 
     url = f"{API_RELEASES}?page=1&per_page=10"
     req = urllib.request.Request(url, headers=_api_headers(token))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import queue
 import subprocess
@@ -39,13 +40,14 @@ except Exception:
 
 from PIL import Image, ImageEnhance, ImageOps, ImageTk
 
-from app_paths import resource_path
+from app_paths import ensure_ui_config, resource_path
 from version import APP_NAME, APP_TITLE, version_string
 from updater import (
     RELEASES_PAGE,
     UpdateInfo,
     can_self_update,
     fetch_latest_update,
+    gitverse_token_missing_message,
     run_update,
 )
 from autoraw_crop import (
@@ -680,6 +682,7 @@ class AutoRawGui(tk.Tk):
         self._etalon_path: str | None = _load_config().get("etalon")
 
         self._build_ui()
+        ensure_ui_config()
         self._set_window_icon()
         self.bind("<Map>", lambda _e: self._schedule_dark_titlebar(), add="+")
         self.after_idle(self._schedule_dark_titlebar)
@@ -2117,6 +2120,34 @@ class AutoRawGui(tk.Tk):
             lines.append(f"Размер: {info.size // (1024 * 1024)} МБ")
         lines.append("После установки приложение перезапустится.")
         return "\n".join(lines)
+
+    def _show_gitverse_token_toast(self) -> None:
+        def _open_settings() -> None:
+            self._close_banner_toast()
+            ensure_ui_config()
+            try:
+                if sys.platform == "win32":
+                    os.startfile(_CONFIG_PATH)  # noqa: S606
+                else:
+                    subprocess.run(["xdg-open", str(_CONFIG_PATH.parent)], check=False)
+            except Exception:
+                pass
+
+        self._show_banner_toast(
+            banner_file="MSG_Vers.png",
+            title="Нужен токен GitVerse",
+            detail=gitverse_token_missing_message(),
+            primary_text="Открыть настройки",
+            on_primary=_open_settings,
+            secondary_text="Позже",
+            on_secondary=self._close_banner_toast,
+            fallback_icon="!",
+            auto_close_ms=None,
+        )
+
+    def _is_gitverse_token_error(self, err: str) -> bool:
+        low = err.lower()
+        return "токен" in low and "gitverse" in low
 
     def _show_export_success_toast(
         self,
@@ -3989,7 +4020,9 @@ AutoRAW Compressor — инструмент пакетной обработки 
         def _worker() -> None:
             try:
                 info = fetch_latest_update()
-            except Exception:
+            except Exception as exc:
+                if self._is_gitverse_token_error(str(exc)):
+                    self.after(0, self._show_gitverse_token_toast)
                 return
             if info is None:
                 return
@@ -4199,6 +4232,13 @@ AutoRAW Compressor — инструмент пакетной обработки 
                 err = str(exc)
 
                 def _fail() -> None:
+                    if self._is_gitverse_token_error(err):
+                        try:
+                            win.destroy()
+                        except Exception:
+                            pass
+                        self._show_gitverse_token_toast()
+                        return
                     set_ui("Ошибка", 0, err)
                     messagebox.showerror("Обновление", err, parent=self)
                     enable_close()

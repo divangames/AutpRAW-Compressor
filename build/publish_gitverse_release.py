@@ -1,6 +1,7 @@
-"""Создать релиз на GitVerse и загрузить portable ZIP."""
+"""Создать или обновить релиз на GitVerse и загрузить portable ZIP."""
 from __future__ import annotations
 
+import argparse
 import json
 import mimetypes
 import sys
@@ -41,7 +42,13 @@ def _multipart_body(fields: dict[str, str], file_field: str, file_path: Path) ->
     return body, f"multipart/form-data; boundary={boundary}"
 
 
-def _request(method: str, url: str, token: str, data: bytes | None = None, content_type: str | None = None) -> dict:
+def _request(
+    method: str,
+    url: str,
+    token: str,
+    data: bytes | None = None,
+    content_type: str | None = None,
+) -> dict | list:
     headers = dict(_api_headers(token))
     if data is not None:
         headers["Content-Type"] = content_type or "application/json"
@@ -57,7 +64,53 @@ def _request(method: str, url: str, token: str, data: bytes | None = None, conte
         raise RuntimeError(f"GitVerse API HTTP {exc.code}: {detail}") from exc
 
 
+def _find_release_by_tag(token: str, tag_name: str) -> dict | None:
+    url = f"{API}/tags/{tag_name}"
+    try:
+        data = _request("GET", url, token)
+        return data if isinstance(data, dict) and data.get("id") else None
+    except RuntimeError as exc:
+        if "404" in str(exc):
+            return None
+        raise
+
+
+def _delete_zip_assets(token: str, release_id: int) -> None:
+    data = _request("GET", f"{API}/{release_id}", token)
+    if not isinstance(data, dict):
+        return
+    for asset in data.get("assets") or []:
+        name = str(asset.get("name", "")).lower()
+        if not name.endswith(".zip"):
+            continue
+        asset_id = asset.get("id")
+        if asset_id is None:
+            continue
+        print(f"Removing old asset: {asset.get('name')}")
+        _request("DELETE", f"{API}/{release_id}/assets/{asset_id}", token)
+
+
+def _upload_zip(token: str, release_id: int, zip_path: Path) -> None:
+    upload_url = f"{API}/{release_id}/assets?name={zip_path.name}"
+    print(f"Uploading {zip_path.name} ({zip_path.stat().st_size / (1024 * 1024):.1f} MB)…")
+    form_body, ctype = _multipart_body({}, "attachment", zip_path)
+    _request("POST", upload_url, token, data=form_body, content_type=ctype)
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Publish or update GitVerse release ZIP")
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="Обновить существующий релиз с тем же тегом (удалить старый ZIP, загрузить новый)",
+    )
+    parser.add_argument(
+        "--create",
+        action="store_true",
+        help="Всегда создавать новый релиз (ошибка, если тег уже есть)",
+    )
+    args = parser.parse_args()
+
     token = gitverse_token().strip()
     if not token:
         print("ERROR: задайте gitverse_token в ui_config.json или GITVERSE_TOKEN")
@@ -71,11 +124,40 @@ def main() -> int:
         return 1
 
     body_text = extract_version_changelog()
+    existing = _find_release_by_tag(token, tag_name)
+    do_update = args.update or (existing is not None and not args.create)
+
+    if do_update:
+        if existing is None:
+            print(f"ERROR: релиз {tag_name} не найден. Запустите без --update для создания.")
+            return 1
+        release_id = int(existing["id"])
+        print(f"Updating release {tag_name} (id={release_id})…")
+        payload = json.dumps(
+            {
+                "name": version,
+                "body": body_text,
+                "draft": False,
+                "prerelease": True,
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        _request("PATCH", f"{API}/{release_id}", token, data=payload, content_type="application/json")
+        _delete_zip_assets(token, release_id)
+        _upload_zip(token, release_id, zip_path)
+        html = existing.get("html_url") or f"https://gitverse.ru/{GITVERSE_OWNER}/{GITVERSE_REPO}/releases/tag/{tag_name}"
+        print(f"Release updated: {html}")
+        return 0
+
+    if existing is not None:
+        print(f"Релиз {tag_name} уже существует. Используйте: python build\\publish_gitverse_release.py --update")
+        return 1
+
     payload = json.dumps(
         {
             "tag_name": tag_name,
             "target_commitish": "master",
-            "name": f"{version}",
+            "name": version,
             "body": body_text,
             "draft": False,
             "prerelease": True,
@@ -86,16 +168,16 @@ def main() -> int:
 
     print(f"Creating release {tag_name}…")
     release = _request("POST", API, token, data=payload, content_type="application/json")
-    release_id = release.get("id")
+    release_id = release.get("id") if isinstance(release, dict) else None
     if not release_id:
         raise RuntimeError(f"Не получен id релиза: {release!r}")
 
-    upload_url = f"{API}/{release_id}/assets?name={zip_path.name}"
-    print(f"Uploading {zip_path.name} ({zip_path.stat().st_size / (1024 * 1024):.1f} MB)…")
-    form_body, ctype = _multipart_body({}, "attachment", zip_path)
-    _request("POST", upload_url, token, data=form_body, content_type=ctype)
-
-    html = release.get("html_url") or f"https://gitverse.ru/{GITVERSE_OWNER}/{GITVERSE_REPO}/releases/tag/{tag_name}"
+    _upload_zip(token, int(release_id), zip_path)
+    html = (
+        release.get("html_url")
+        if isinstance(release, dict)
+        else f"https://gitverse.ru/{GITVERSE_OWNER}/{GITVERSE_REPO}/releases/tag/{tag_name}"
+    )
     print(f"Release published: {html}")
     return 0
 

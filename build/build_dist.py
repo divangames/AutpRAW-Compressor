@@ -98,6 +98,12 @@ def copy_assets(target: Path) -> None:
     else:
         print(f"Warning: missing {changelog}")
 
+    example_cfg = ROOT / "ui_config.example.json"
+    dest_cfg = target / "ui_config.json"
+    if example_cfg.is_file() and not dest_cfg.exists():
+        shutil.copy2(example_cfg, dest_cfg)
+        print(f"Copied ui_config.example.json -> {dest_cfg}")
+
 
 def write_launchers(target: Path) -> None:
     (target / "run_gui.bat").write_text(
