@@ -66,8 +66,12 @@ from autoraw_crop import (
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".nef", ".dng"}
 PREVIEW_SIZE = (700, 525)
 RIGHT_PANEL_W = 320
+COLORCOR_PANEL_W = 288
 THUMB_SIZE = (138, 104)
 ZOOM_MAX = 3.0
+WORKSPACE_ZOOM_MIN = 0.5
+WORKSPACE_ZOOM_MAX = 2.5
+WORKSPACE_ZOOM_STEP = 0.1
 
 # ── Palettes (Light / Dark) ──────────────────────────────────────
 _PALETTES: dict[str, dict[str, str]] = {
@@ -249,10 +253,14 @@ REFERENCE_DIR = resource_path("reference", "Sneakers")
 SEARCH_REFERENCE_DIR = REFERENCE_DIR / "search"
 WORKING_MAX_SIDE = 2600
 STANDARD_PROFILE = "Adobe Стандарт"
-STANDARD_CONTRAST = 20
-STANDARD_SHADOWS = 13
-STANDARD_TEMPERATURE = 6500
-STANDARD_TINT = 4
+STANDARD_EXPOSURE = 0
+STANDARD_CONTRAST = 18
+STANDARD_SHADOWS = 14
+STANDARD_HIGHLIGHTS = -8
+STANDARD_BLACKS = -6
+STANDARD_SATURATION = 6
+STANDARD_TEMPERATURE = 6650
+STANDARD_TINT = 5
 DROPLETS_DIR = resource_path("droplets")
 DROPLET_BY_FRAME = {
     "01": "01_drop.exe",
@@ -279,8 +287,12 @@ class FrameState:
     zoom: float = 1.0
     rotation: float = 0.0
     profile: str = STANDARD_PROFILE
+    exposure: int = STANDARD_EXPOSURE
     contrast: int = STANDARD_CONTRAST
     shadows: int = STANDARD_SHADOWS
+    highlights: int = STANDARD_HIGHLIGHTS
+    blacks: int = STANDARD_BLACKS
+    saturation: int = STANDARD_SATURATION
     temperature: int = STANDARD_TEMPERATURE
     tint: int = STANDARD_TINT
     thumb_cache: Image.Image | None = None
@@ -451,6 +463,20 @@ def export_name_for_frame(frame: FrameState) -> str:
     return f"{frame.path.stem}.jpg"
 
 
+def position_frame_number(index: int) -> str:
+    return f"{index + 1:02d}"
+
+
+def apply_frame_numbers_by_order(frames: list[FrameState], aspect: float) -> None:
+    """Renumber frames 01..N by list order and refresh crop rules for each slot."""
+    for index, state in enumerate(frames):
+        frame_num = position_frame_number(index)
+        state.frame = frame_num
+        state.crop_box = crop_box_for_assigned_frame(state.path, state.image, aspect, frame_num)
+        state.thumb_cache = None
+        state.match_score = None
+
+
 def has_direct_sources(folder: Path) -> bool:
     try:
         return any(path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS for path in folder.iterdir())
@@ -597,29 +623,58 @@ def _clamp_int(value: int, min_value: int, max_value: int) -> int:
     return max(min_value, min(max_value, int(value)))
 
 
+def _tone_mask(luma: Image.Image, *, start: int, end: int) -> Image.Image:
+    span = max(1, end - start)
+    return luma.point(lambda v, s=start, e=end, sp=span: max(0, min(255, int((v - s) * 255 / sp))))
+
+
 def apply_standard_look(
     img: Image.Image,
     *,
+    exposure: int = STANDARD_EXPOSURE,
     contrast: int = STANDARD_CONTRAST,
     shadows: int = STANDARD_SHADOWS,
+    highlights: int = STANDARD_HIGHLIGHTS,
+    blacks: int = STANDARD_BLACKS,
+    saturation: int = STANDARD_SATURATION,
     temperature: int = STANDARD_TEMPERATURE,
     tint: int = STANDARD_TINT,
 ) -> Image.Image:
+    exposure = _clamp_int(exposure, -30, 30)
     contrast = _clamp_int(contrast, -100, 100)
     shadows = _clamp_int(shadows, -100, 100)
+    highlights = _clamp_int(highlights, -100, 100)
+    blacks = _clamp_int(blacks, -100, 100)
+    saturation = _clamp_int(saturation, -100, 100)
     temperature = _clamp_int(temperature, 2000, 10000)
     tint = _clamp_int(tint, -100, 100)
 
-    # Contrast
-    result = ImageEnhance.Contrast(img).enhance(1.0 + contrast / 100.0)
+    result = img
+    if exposure:
+        result = ImageEnhance.Brightness(result).enhance(1.0 + exposure / 100.0)
 
-    # Shadows (lift dark areas stronger than highlights)
-    lifted = ImageEnhance.Brightness(result).enhance(1.0 + shadows / 100.0)
-    inv_luma = ImageOps.invert(result.convert("L"))
-    shadow_mask = inv_luma.point(lambda v: max(0, min(255, int(v * 0.42))))
-    result = Image.composite(lifted, result, shadow_mask)
+    if contrast:
+        result = ImageEnhance.Contrast(result).enhance(1.0 + contrast / 100.0)
 
-    # Temperature and tint. Neutral point is 6500 (your base preset).
+    luma = result.convert("L")
+
+    if shadows:
+        lifted = ImageEnhance.Brightness(result).enhance(1.0 + shadows / 100.0)
+        shadow_mask = ImageOps.invert(luma).point(lambda v: max(0, min(255, int(v * 0.42))))
+        result = Image.composite(lifted, result, shadow_mask)
+        luma = result.convert("L")
+
+    if highlights:
+        hi_adj = ImageEnhance.Brightness(result).enhance(1.0 + highlights / 150.0)
+        hi_mask = _tone_mask(luma, start=155, end=240)
+        result = Image.composite(hi_adj, result, hi_mask)
+        luma = result.convert("L")
+
+    if blacks:
+        blk_adj = ImageEnhance.Brightness(result).enhance(1.0 + blacks / 120.0)
+        blk_mask = luma.point(lambda v: max(0, min(255, int((72 - v) * 255 / 72))))
+        result = Image.composite(blk_adj, result, blk_mask)
+
     temp_delta = (temperature - 6500) / 2500.0
     r_mult = 1.0 + 0.015 * temp_delta
     b_mult = 1.0 - 0.015 * temp_delta
@@ -630,12 +685,30 @@ def apply_standard_look(
     b_mult *= 1.0 + 0.006 * tint_delta
     g_mult *= 1.0 - 0.010 * tint_delta
 
-    # Safety bounds against accidental extreme cast.
     r_mult = max(0.85, min(1.15, r_mult))
     g_mult = max(0.85, min(1.15, g_mult))
     b_mult = max(0.85, min(1.15, b_mult))
 
-    return _channel_mult(result, r_mult=r_mult, g_mult=g_mult, b_mult=b_mult)
+    result = _channel_mult(result, r_mult=r_mult, g_mult=g_mult, b_mult=b_mult)
+
+    if saturation:
+        result = ImageEnhance.Color(result).enhance(1.0 + saturation / 100.0)
+
+    return result
+
+
+def apply_frame_colorcor(img: Image.Image, state: FrameState) -> Image.Image:
+    return apply_standard_look(
+        img,
+        exposure=state.exposure,
+        contrast=state.contrast,
+        shadows=state.shadows,
+        highlights=state.highlights,
+        blacks=state.blacks,
+        saturation=state.saturation,
+        temperature=state.temperature,
+        tint=state.tint,
+    )
 
 
 class AutoRawGui(tk.Tk):
@@ -650,9 +723,12 @@ class AutoRawGui(tk.Tk):
         self.selected_folder: Path | None = None
         self.selected_index = 0
         self.preview_photo: ImageTk.PhotoImage | None = None
+        self.preview_workspace_scale = 1.0
         self.thumb_photos: list[ImageTk.PhotoImage] = []
         # (px, py, base_offset_x, base_offset_y, base_rotation)
         self.drag_start: tuple[int, int, float, float, float] | None = None
+        self._space_held = False
+        self._preview_panning = False
         self._updating_controls = False
         self.worker_events: queue.Queue[tuple] = queue.Queue()
         self.load_token = 0
@@ -663,6 +739,10 @@ class AutoRawGui(tk.Tk):
         self.drop_window: tk.Toplevel | None = None
         self._menu_popups: list[tk.Toplevel] = []
         self.thumb_btns: list[tk.Label] = []
+        self.thumb_cards: list[tk.Frame] = []
+        self._thumb_drag: dict[str, int | bool] | None = None
+        self._thumb_drop_index: int | None = None
+        self.colorcor_drawer_visible = False
         self._export_job = JobControl()
         self._export_running = False
         self._export_token = 0
@@ -719,6 +799,7 @@ class AutoRawGui(tk.Tk):
         saved_idx      = self.selected_index
         saved_loading  = self.loading_frames
         saved_token    = self.load_token
+        saved_drawer   = getattr(self, "colorcor_drawer_visible", False)
 
         # Destroy all widgets and rebuild with updated FIG_* globals
         for w in self.winfo_children():
@@ -735,6 +816,9 @@ class AutoRawGui(tk.Tk):
         self.selected_index  = saved_idx
         self.loading_frames  = saved_loading
         self.load_token      = saved_token
+        self.colorcor_drawer_visible = saved_drawer
+        if saved_drawer:
+            self.after_idle(self._show_colorcor_drawer)
 
         if saved_root:
             self.drop_var.set(str(saved_root))
@@ -1580,6 +1664,8 @@ class AutoRawGui(tk.Tk):
 
         # F1 hotkey — show hotkeys dialog
         self.bind("<F1>", lambda _e: self.show_hotkeys())
+        self.bind_all("<KeyPress-space>", self._preview_space_press)
+        self.bind_all("<KeyRelease-space>", self._preview_space_release)
 
         # ── Path / action toolbar ─────────────────────────────────────
         bar = tk.Frame(self, bg=FIG_PANEL, height=44)
@@ -1754,13 +1840,32 @@ class AutoRawGui(tk.Tk):
         self.thumb_canvas.bind("<MouseWheel>", self._on_thumb_mousewheel)
         self.thumbs.bind("<MouseWheel>", self._on_thumb_mousewheel)
 
-        # ── Center: canvas + controls + colour ───────────────────
-        center = tk.Frame(body, bg=FIG_BG)
-        center.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # ── Center: canvas + transform controls ───────────────────
+        self.center_frame = tk.Frame(body, bg=FIG_BG)
+        self.center_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        center = self.center_frame
 
-        self.preview = tk.Canvas(center, width=PREVIEW_SIZE[0], height=PREVIEW_SIZE[1],
-                                  bg=_PREVIEW_BG, highlightthickness=0)
-        self.preview.pack(fill=tk.BOTH, expand=True)
+        preview_wrap = tk.Frame(center, bg=FIG_BG)
+        preview_wrap.pack(fill=tk.BOTH, expand=True)
+        preview_wrap.grid_rowconfigure(0, weight=1)
+        preview_wrap.grid_columnconfigure(0, weight=1)
+
+        self.preview = tk.Canvas(
+            preview_wrap,
+            width=PREVIEW_SIZE[0],
+            height=PREVIEW_SIZE[1],
+            bg=_PREVIEW_BG,
+            highlightthickness=0,
+        )
+        self.preview.grid(row=0, column=0, sticky="nsew")
+        preview_scroll_y = ttk.Scrollbar(preview_wrap, orient=tk.VERTICAL, command=self.preview.yview)
+        preview_scroll_x = ttk.Scrollbar(preview_wrap, orient=tk.HORIZONTAL, command=self.preview.xview)
+        preview_scroll_y.grid(row=0, column=1, sticky="ns")
+        preview_scroll_x.grid(row=1, column=0, sticky="ew")
+        self.preview.configure(
+            xscrollcommand=preview_scroll_x.set,
+            yscrollcommand=preview_scroll_y.set,
+        )
         self.preview.bind("<ButtonPress-1>", self.start_drag)
         self.preview.bind("<B1-Motion>",     self.drag_preview)
         self.preview.bind("<ButtonRelease-1>", self.stop_drag)
@@ -1795,64 +1900,134 @@ class AutoRawGui(tk.Tk):
         rb.pack(fill=tk.X, pady=(2, 10))
         ttk.Button(rb, text="Сбросить кадр",  command=self.reset_current).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(rb, text="Сбросить папку", command=self.reset_folder).pack(side=tk.LEFT)
-
-        # ── Colour correction ─────────────────────────────────────────
-        tk.Frame(bottom, bg=FIG_BORDER, height=1).pack(fill=tk.X)
-
-        self.profile_var     = tk.StringVar(value=STANDARD_PROFILE)
-        self.contrast_var    = tk.IntVar(value=STANDARD_CONTRAST)
-        self.shadows_var     = tk.IntVar(value=STANDARD_SHADOWS)
-        self.temperature_var = tk.IntVar(value=STANDARD_TEMPERATURE)
-        self.tint_var        = tk.IntVar(value=STANDARD_TINT)
-        self.use_colorcor_var = tk.BooleanVar(value=False)
-
-        cc_wrap = tk.Frame(bottom, bg=FIG_PANEL)
-        cc_wrap.pack(fill=tk.X, padx=16, pady=(8, 10))
-
-        # ── row 0: heading + actions ─────────────────────────────────
-        cc_head = tk.Frame(cc_wrap, bg=FIG_PANEL)
-        cc_head.pack(fill=tk.X, pady=(0, 8))
-
-        # mini accent pip + label
-        pip_row = tk.Frame(cc_head, bg=FIG_PANEL)
-        pip_row.pack(side=tk.LEFT)
-        tk.Frame(pip_row, bg=FIG_ACCENT, width=3, height=12).pack(side=tk.LEFT, padx=(0, 6))
-        tk.Label(pip_row, text="ЦВЕТОКОР", bg=FIG_PANEL, fg=FIG_TEXT2,
-                 font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT)
-
-        # switch + action buttons on the right
-        cc_right = tk.Frame(cc_head, bg=FIG_PANEL)
-        cc_right.pack(side=tk.RIGHT)
-        self.colorcor_switch = self._make_switch(
-            cc_right, self.use_colorcor_var, self.on_colorcor_toggle, modern=True
+        self.colorcor_toggle_btn = ttk.Button(
+            rb,
+            text="Цветокор ▸",
+            style="Ghost.TButton",
+            command=self._toggle_colorcor_drawer,
         )
-        self.colorcor_switch.pack(side=tk.LEFT, padx=(0, 14))
-        ttk.Button(cc_right, text="Сохранить",
-                   command=self.save_color_settings).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(cc_right, text="Сбросить",
-                   command=self.reset_color_settings).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Button(cc_right, text="Применить к папке",
-                   command=self.apply_look_to_folder).pack(side=tk.LEFT)
+        self.colorcor_toggle_btn.pack(side=tk.RIGHT)
 
-        # ── compact sliders (2 × 2) ───────────────────────────────────
-        cc_fields = tk.Frame(cc_wrap, bg=FIG_PANEL)
-        cc_fields.pack(fill=tk.X, pady=(4, 0))
-
-        cc_row1 = tk.Frame(cc_fields, bg=FIG_PANEL)
-        cc_row1.pack(fill=tk.X)
-        cc_row2 = tk.Frame(cc_fields, bg=FIG_PANEL)
-        cc_row2.pack(fill=tk.X, pady=(4, 0))
-
-        self._slider(cc_row1, "Контраст",    -100,  100,   self.update_current,
-                     "{:.0f}",  compact=True, existing_var=self.contrast_var, editable=True)
-        self._slider(cc_row1, "Тени",        -100,  100,   self.update_current,
-                     "{:.0f}",  compact=True, existing_var=self.shadows_var, editable=True)
-        self._slider(cc_row2, "Температура", 2000, 10000,  self.update_current,
-                     "{:.0f}K", compact=True, existing_var=self.temperature_var, editable=True)
-        self._slider(cc_row2, "Оттенок",     -100,  100,   self.update_current,
-                     "{:.0f}",  compact=True, existing_var=self.tint_var, editable=True)
+        self._init_colorcor_vars()
+        self._build_colorcor_drawer(body)
 
         self.after_idle(self._sync_export_ui)
+
+    def _init_colorcor_vars(self) -> None:
+        self.profile_var = tk.StringVar(value=STANDARD_PROFILE)
+        self.exposure_var = tk.IntVar(value=STANDARD_EXPOSURE)
+        self.contrast_var = tk.IntVar(value=STANDARD_CONTRAST)
+        self.shadows_var = tk.IntVar(value=STANDARD_SHADOWS)
+        self.highlights_var = tk.IntVar(value=STANDARD_HIGHLIGHTS)
+        self.blacks_var = tk.IntVar(value=STANDARD_BLACKS)
+        self.saturation_var = tk.IntVar(value=STANDARD_SATURATION)
+        self.temperature_var = tk.IntVar(value=STANDARD_TEMPERATURE)
+        self.tint_var = tk.IntVar(value=STANDARD_TINT)
+        self.use_colorcor_var = tk.BooleanVar(value=False)
+
+    def _build_colorcor_drawer(self, body: tk.Frame) -> None:
+        self.colorcor_drawer = tk.Frame(body, bg=FIG_PANEL, width=COLORCOR_PANEL_W)
+        self.colorcor_drawer.pack_propagate(False)
+
+        head = tk.Frame(self.colorcor_drawer, bg=FIG_PANEL)
+        head.pack(fill=tk.X, padx=12, pady=(10, 6))
+        pip_row = tk.Frame(head, bg=FIG_PANEL)
+        pip_row.pack(side=tk.LEFT)
+        tk.Frame(pip_row, bg=FIG_ACCENT, width=3, height=14).pack(side=tk.LEFT, padx=(0, 6))
+        tk.Label(pip_row, text="ЦВЕТОКОР", bg=FIG_PANEL, fg=FIG_TEXT2,
+                 font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
+        head_right = tk.Frame(head, bg=FIG_PANEL)
+        head_right.pack(side=tk.RIGHT)
+        self.colorcor_switch = self._make_switch(
+            head_right, self.use_colorcor_var, self.on_colorcor_toggle, modern=True
+        )
+        self.colorcor_switch.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(
+            head_right,
+            text="✕",
+            style="Ghost.TButton",
+            width=3,
+            command=self._hide_colorcor_drawer,
+        ).pack(side=tk.LEFT)
+
+        tk.Frame(self.colorcor_drawer, bg=FIG_BORDER, height=1).pack(fill=tk.X)
+
+        scroll_wrap = tk.Frame(self.colorcor_drawer, bg=FIG_PANEL)
+        scroll_wrap.pack(fill=tk.BOTH, expand=True)
+        cc_canvas = tk.Canvas(scroll_wrap, bg=FIG_PANEL, highlightthickness=0, bd=0)
+        cc_scroll = self._win11_sb(scroll_wrap, orient=tk.VERTICAL, command=cc_canvas.yview)
+        cc_canvas.configure(yscrollcommand=cc_scroll.set)
+        cc_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        cc_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        cc_inner = tk.Frame(cc_canvas, bg=FIG_PANEL)
+        cc_window = cc_canvas.create_window((0, 0), window=cc_inner, anchor=tk.NW, width=COLORCOR_PANEL_W - 20)
+
+        def _on_inner_configure(_event: tk.Event | None = None) -> None:
+            cc_canvas.configure(scrollregion=cc_canvas.bbox("all"))
+
+        def _on_canvas_configure(event: tk.Event) -> None:
+            cc_canvas.itemconfigure(cc_window, width=max(1, event.width))
+
+        cc_inner.bind("<Configure>", _on_inner_configure)
+        cc_canvas.bind("<Configure>", _on_canvas_configure)
+        cc_canvas.bind("<MouseWheel>", lambda e: cc_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+
+        sliders = [
+            ("Экспозиция", -30, 30, "{:.0f}", self.exposure_var),
+            ("Контраст", -100, 100, "{:.0f}", self.contrast_var),
+            ("Тени", -100, 100, "{:.0f}", self.shadows_var),
+            ("Света", -100, 100, "{:.0f}", self.highlights_var),
+            ("Чёрные", -100, 100, "{:.0f}", self.blacks_var),
+            ("Насыщенность", -100, 100, "{:.0f}", self.saturation_var),
+            ("Температура", 2000, 10000, "{:.0f}K", self.temperature_var),
+            ("Оттенок", -100, 100, "{:.0f}", self.tint_var),
+        ]
+        for label, start, end, fmt, var in sliders:
+            self._slider(
+                cc_inner,
+                label,
+                start,
+                end,
+                self.update_current,
+                fmt,
+                stacked=True,
+                existing_var=var,
+                editable=True,
+            )
+
+        foot = tk.Frame(self.colorcor_drawer, bg=FIG_PANEL)
+        foot.pack(fill=tk.X, padx=12, pady=(4, 10))
+        ttk.Button(foot, text="Сохранить", command=self.save_color_settings).pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(foot, text="Сбросить", command=self.reset_color_settings).pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(foot, text="Применить к папке", command=self.apply_look_to_folder).pack(fill=tk.X)
+
+    def _sync_colorcor_drawer_btn(self) -> None:
+        if not hasattr(self, "colorcor_toggle_btn"):
+            return
+        self.colorcor_toggle_btn.configure(
+            text="Скрыть ◂" if self.colorcor_drawer_visible else "Цветокор ▸",
+        )
+
+    def _show_colorcor_drawer(self) -> None:
+        if self.colorcor_drawer_visible:
+            return
+        self.colorcor_drawer_visible = True
+        self.colorcor_drawer.pack(side=tk.RIGHT, fill=tk.Y)
+        self._sync_colorcor_drawer_btn()
+
+    def _hide_colorcor_drawer(self) -> None:
+        if not self.colorcor_drawer_visible:
+            return
+        self.colorcor_drawer_visible = False
+        self.colorcor_drawer.pack_forget()
+        self._sync_colorcor_drawer_btn()
+
+    def _toggle_colorcor_drawer(self) -> None:
+        if self.colorcor_drawer_visible:
+            self._hide_colorcor_drawer()
+        else:
+            self._show_colorcor_drawer()
 
     def _on_export_action(self) -> None:
         if self._export_running:
@@ -2220,11 +2395,13 @@ class AutoRawGui(tk.Tk):
         command,
         fmt: str = "{:.0f}",
         compact: bool = False,
+        stacked: bool = False,
         existing_var: tk.Variable | None = None,
         editable: bool = False,
     ) -> tk.DoubleVar:
         """Canvas slider — thin track, accent fill, round thumb.
         compact=True → smaller (used for colour-correction row).
+        stacked=True → full-width row (side drawer).
         existing_var → reuse an existing IntVar/DoubleVar instead of creating a new one.
         editable=True → поле ввода числа справа от подписи.
         """
@@ -2236,7 +2413,10 @@ class AutoRawGui(tk.Tk):
         fmt_suffix = "K" if fmt.rstrip().endswith("K") else ""
 
         col = tk.Frame(parent, bg=BG)
-        col.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 12 if compact else 16))
+        if stacked:
+            col.pack(fill=tk.X, padx=12, pady=(0, 8))
+        else:
+            col.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 12 if compact else 16))
 
         hdr = tk.Frame(col, bg=BG)
         hdr.pack(fill=tk.X, pady=(0, 1))
@@ -2742,6 +2922,9 @@ class AutoRawGui(tk.Tk):
         for child in self.thumbs.winfo_children():
             child.destroy()
         self.thumb_photos = []
+        self.thumb_cards = []
+        self._thumb_drag = None
+        self._thumb_drop_index = None
         self.info_var.set(message)
         self.preview.delete("all")
 
@@ -2759,6 +2942,117 @@ class AutoRawGui(tk.Tk):
             else:
                 btn.configure(highlightbackground=FIG_BORDER, highlightthickness=1, bd=0)
 
+    _THUMB_DRAG_THRESHOLD = 10
+
+    def _thumb_index_at_root(self, x_root: int, y_root: int) -> int | None:
+        for index, card in enumerate(self.thumb_cards):
+            if not card.winfo_exists():
+                continue
+            cx = card.winfo_rootx()
+            cy = card.winfo_rooty()
+            cw = max(card.winfo_width(), 1)
+            ch = max(card.winfo_height(), 1)
+            if cx <= x_root < cx + cw and cy <= y_root < cy + ch:
+                return index
+        return None
+
+    def _set_thumb_drop_highlight(self, index: int | None) -> None:
+        if self._thumb_drop_index == index:
+            return
+        if self._thumb_drop_index is not None and 0 <= self._thumb_drop_index < len(self.thumb_cards):
+            prev = self.thumb_cards[self._thumb_drop_index]
+            if prev.winfo_exists():
+                prev.configure(highlightbackground=FIG_BORDER, highlightthickness=1)
+        self._thumb_drop_index = index
+        if index is not None and 0 <= index < len(self.thumb_cards):
+            card = self.thumb_cards[index]
+            if card.winfo_exists():
+                card.configure(highlightbackground=FIG_ACCENT, highlightthickness=2)
+
+    def _bind_thumb_drag(self, widget: tk.Misc, index: int) -> None:
+        widget.bind("<ButtonPress-1>", lambda e, i=index: self._thumb_drag_press(e, i), add="+")
+        widget.bind("<B1-Motion>", self._thumb_drag_motion, add="+")
+        widget.bind("<ButtonRelease-1>", self._thumb_drag_release, add="+")
+
+    def _thumb_drag_press(self, event: tk.Event, index: int) -> None:
+        self._thumb_drag = {
+            "index": index,
+            "start_x": event.x_root,
+            "start_y": event.y_root,
+            "dragging": False,
+        }
+
+    def _thumb_drag_motion(self, event: tk.Event) -> None:
+        drag = self._thumb_drag
+        if not drag:
+            return
+        if not drag["dragging"]:
+            dx = abs(event.x_root - int(drag["start_x"]))
+            dy = abs(event.y_root - int(drag["start_y"]))
+            if dx + dy < self._THUMB_DRAG_THRESHOLD:
+                return
+            drag["dragging"] = True
+            self.configure(cursor="hand2")
+        drop_index = self._thumb_index_at_root(event.x_root, event.y_root)
+        self._set_thumb_drop_highlight(drop_index)
+
+    def _thumb_drag_release(self, event: tk.Event) -> None:
+        drag = self._thumb_drag
+        self._thumb_drag = None
+        self.configure(cursor="")
+        self._set_thumb_drop_highlight(None)
+        if not drag:
+            return
+        from_index = int(drag["index"])
+        if drag["dragging"]:
+            to_index = self._thumb_index_at_root(event.x_root, event.y_root)
+            if to_index is None:
+                to_index = from_index
+            self._reorder_frames(from_index, to_index)
+            return
+        self.select_frame(from_index)
+
+    def _reorder_frames(self, from_index: int, to_index: int) -> None:
+        frames = self.current_frames()
+        if not frames or not (0 <= from_index < len(frames)):
+            return
+        to_index = max(0, min(to_index, len(frames) - 1))
+        if from_index == to_index:
+            self.select_frame(from_index)
+            return
+
+        self._save_controls_to_current()
+        was_selected = self.selected_index == from_index
+        selected_state = frames[from_index] if was_selected else None
+
+        item = frames.pop(from_index)
+        frames.insert(to_index, item)
+
+        if self.selected_folder:
+            self.folder_states[self.selected_folder].frames = frames
+
+        aspect = target_aspect(REFERENCE_DIR)
+        apply_frame_numbers_by_order(frames, aspect)
+
+        if was_selected and selected_state is not None:
+            new_index = frames.index(selected_state)
+        elif from_index < self.selected_index <= to_index:
+            new_index = self.selected_index - 1
+        elif to_index <= self.selected_index < from_index:
+            new_index = self.selected_index + 1
+        else:
+            new_index = self.selected_index
+        new_index = max(0, min(new_index, len(frames) - 1))
+
+        self.selected_index = new_index
+        self.render_thumbnails()
+        self.select_frame(new_index, save_previous=False)
+        folder_name = self.selected_folder.name if self.selected_folder else ""
+        self.set_progress(
+            self.progress_var.get(),
+            f"Порядок кадров обновлён ({folder_name}): {len(frames)} шт.",
+        )
+
     def _refresh_single_thumb(self, index: int) -> None:
         """Re-render one thumbnail in-place without rebuilding the whole panel."""
         frames = self.current_frames()
@@ -2774,13 +3068,7 @@ class AutoRawGui(tk.Tk):
         state.thumb_cache = None  # force re-render
         thumb = render_frame(state, THUMB_SIZE)
         if self.use_colorcor_var.get():
-            thumb = apply_standard_look(
-                thumb,
-                contrast=state.contrast,
-                shadows=state.shadows,
-                temperature=state.temperature,
-                tint=state.tint,
-            )
+            thumb = apply_frame_colorcor(thumb, state)
         state.thumb_cache = thumb
         photo = ImageTk.PhotoImage(thumb)
         btn.configure(image=photo)
@@ -2795,6 +3083,7 @@ class AutoRawGui(tk.Tk):
 
         self.thumb_photos = []
         self.thumb_btns = []
+        self.thumb_cards = []
 
         self.thumbs.grid_columnconfigure(0, weight=1, uniform="thumb")
         self.thumbs.grid_columnconfigure(1, weight=1, uniform="thumb")
@@ -2804,9 +3093,10 @@ class AutoRawGui(tk.Tk):
         for index, state in enumerate(self.current_frames()):
             is_selected = (index == self.selected_index)
 
-            card = tk.Frame(self.thumbs, bg=FIG_SURFACE, width=card_w)
+            card = tk.Frame(self.thumbs, bg=FIG_SURFACE, width=card_w, cursor="hand2")
             card.grid(row=index // 2, column=index % 2, padx=4, pady=5, sticky="n")
             card.configure(highlightthickness=1, highlightbackground=FIG_BORDER)
+            self.thumb_cards.append(card)
 
             badge_row = tk.Frame(card, bg=FIG_SURFACE)
             badge_row.pack(fill=tk.X, pady=(0, 2))
@@ -2830,13 +3120,7 @@ class AutoRawGui(tk.Tk):
             if state.thumb_cache is None:
                 thumb = render_frame(state, THUMB_SIZE)
                 if self.use_colorcor_var.get():
-                    state.thumb_cache = apply_standard_look(
-                        thumb,
-                        contrast=state.contrast,
-                        shadows=state.shadows,
-                        temperature=state.temperature,
-                        tint=state.tint,
-                    )
+                    state.thumb_cache = apply_frame_colorcor(thumb, state)
                 else:
                     state.thumb_cache = thumb
             photo = ImageTk.PhotoImage(state.thumb_cache)
@@ -2849,7 +3133,8 @@ class AutoRawGui(tk.Tk):
             )
             btn.pack()
             self.thumb_btns.append(btn)
-            btn.bind("<Button-1>", lambda _e, i=index: self.select_frame(i))
+            self._bind_thumb_drag(card, index)
+            self._bind_thumb_drag(btn, index)
             btn.bind("<Enter>", lambda _e, b=btn, i=index: (
                 b.configure(highlightbackground=FIG_ACCENT, highlightthickness=2)
                 if i != self.selected_index else None
@@ -2863,9 +3148,11 @@ class AutoRawGui(tk.Tk):
             short_name = state.path.name
             if len(short_name) > 16:
                 short_name = short_name[:13] + "…"
-            tk.Label(card, text=short_name, bg=FIG_SURFACE, fg=FIG_TEXT2,
-                     font=("Segoe UI", 8), width=18, anchor="w").pack(anchor="w", pady=(2, 0))
-            for widget in (card, badge_row, btn):
+            name_lbl = tk.Label(card, text=short_name, bg=FIG_SURFACE, fg=FIG_TEXT2,
+                                font=("Segoe UI", 8), width=18, anchor="w")
+            name_lbl.pack(anchor="w", pady=(2, 0))
+            self._bind_thumb_drag(name_lbl, index)
+            for widget in (card, badge_row, btn, name_lbl):
                 widget.bind("<MouseWheel>", self._on_thumb_mousewheel)
 
         if hasattr(self, "thumb_canvas"):
@@ -2887,6 +3174,28 @@ class AutoRawGui(tk.Tk):
         var.set(value)
         return value
 
+    def _read_colorcor_vars(self, state: FrameState) -> None:
+        state.profile = self.profile_var.get() or STANDARD_PROFILE
+        state.exposure = self._coerce_int(self.exposure_var, STANDARD_EXPOSURE, -30, 30)
+        state.contrast = self._coerce_int(self.contrast_var, STANDARD_CONTRAST, -100, 100)
+        state.shadows = self._coerce_int(self.shadows_var, STANDARD_SHADOWS, -100, 100)
+        state.highlights = self._coerce_int(self.highlights_var, STANDARD_HIGHLIGHTS, -100, 100)
+        state.blacks = self._coerce_int(self.blacks_var, STANDARD_BLACKS, -100, 100)
+        state.saturation = self._coerce_int(self.saturation_var, STANDARD_SATURATION, -100, 100)
+        state.temperature = self._coerce_int(self.temperature_var, STANDARD_TEMPERATURE, 2000, 10000)
+        state.tint = self._coerce_int(self.tint_var, STANDARD_TINT, -100, 100)
+
+    def _write_colorcor_vars(self, state: FrameState) -> None:
+        self.profile_var.set(state.profile)
+        self.exposure_var.set(state.exposure)
+        self.contrast_var.set(state.contrast)
+        self.shadows_var.set(state.shadows)
+        self.highlights_var.set(state.highlights)
+        self.blacks_var.set(state.blacks)
+        self.saturation_var.set(state.saturation)
+        self.temperature_var.set(state.temperature)
+        self.tint_var.set(state.tint)
+
     def _save_controls_to_current(self) -> None:
         if self._updating_controls:
             return
@@ -2897,11 +3206,7 @@ class AutoRawGui(tk.Tk):
         state.offset_y = self.offset_y.get()
         state.zoom = self.zoom.get() or 1.0
         state.rotation = self.rotation.get()
-        state.profile = self.profile_var.get() or STANDARD_PROFILE
-        state.contrast = self._coerce_int(self.contrast_var, STANDARD_CONTRAST, -100, 100)
-        state.shadows = self._coerce_int(self.shadows_var, STANDARD_SHADOWS, -100, 100)
-        state.temperature = self._coerce_int(self.temperature_var, STANDARD_TEMPERATURE, 2000, 10000)
-        state.tint = self._coerce_int(self.tint_var, STANDARD_TINT, -100, 100)
+        self._read_colorcor_vars(state)
 
     def select_frame(self, index: int, *, save_previous: bool = True) -> None:
         prev_index = self.selected_index
@@ -2923,11 +3228,7 @@ class AutoRawGui(tk.Tk):
         self.offset_y.set(state.offset_y)
         self.zoom.set(state.zoom)
         self.rotation.set(state.rotation)
-        self.profile_var.set(state.profile)
-        self.contrast_var.set(state.contrast)
-        self.shadows_var.set(state.shadows)
-        self.temperature_var.set(state.temperature)
-        self.tint_var.set(state.tint)
+        self._write_colorcor_vars(state)
         self._updating_controls = False
         folder_text = self.selected_folder.name if self.selected_folder else ""
         match_text = ""
@@ -2937,7 +3238,7 @@ class AutoRawGui(tk.Tk):
         self.info_var.set(
             f"📁  {folder_text}\n"
             f"🖼  {state.frame}{match_text} — {state.path.name}\n"
-            f"⌨  Стрелки / мышь / колесо"
+            f"⌨  Стрелки / колесо · Пробел+ЛКМ — сдвиг зоны · Ctrl+колесо — {int(self.preview_workspace_scale * 100)}%"
         )
         self.preview.focus_set()
         self._highlight_selected_thumb()
@@ -2960,23 +3261,26 @@ class AutoRawGui(tk.Tk):
         state.thumb_cache = None
         self.render_preview()
 
+    def _preview_display_size(self) -> tuple[int, int]:
+        scale = self.preview_workspace_scale
+        return (
+            max(1, int(PREVIEW_SIZE[0] * scale)),
+            max(1, int(PREVIEW_SIZE[1] * scale)),
+        )
+
     def render_preview(self) -> None:
         state = self.current()
         if not state:
             return
 
-        img = render_frame(state, PREVIEW_SIZE)
+        display_size = self._preview_display_size()
+        img = render_frame(state, display_size)
         if self.use_colorcor_var.get():
-            img = apply_standard_look(
-                img,
-                contrast=state.contrast,
-                shadows=state.shadows,
-                temperature=state.temperature,
-                tint=state.tint,
-            )
+            img = apply_frame_colorcor(img, state)
         self.preview_photo = ImageTk.PhotoImage(img)
         self.preview.delete("all")
         self.preview.create_image(0, 0, image=self.preview_photo, anchor=tk.NW)
+        self.preview.configure(scrollregion=(0, 0, display_size[0], display_size[1]))
         self.draw_guides(state.frame)
 
     def on_colorcor_toggle(self) -> None:
@@ -3000,31 +3304,25 @@ class AutoRawGui(tk.Tk):
         if not current:
             self.set_progress(self.progress_var.get(), "Нет выбранного кадра для сохранения настроек")
             return
-        current.profile = self.profile_var.get() or STANDARD_PROFILE
-        current.contrast = self._coerce_int(self.contrast_var, STANDARD_CONTRAST, -100, 100)
-        current.shadows = self._coerce_int(self.shadows_var, STANDARD_SHADOWS, -100, 100)
-        current.temperature = self._coerce_int(self.temperature_var, STANDARD_TEMPERATURE, 2000, 10000)
-        current.tint = self._coerce_int(self.tint_var, STANDARD_TINT, -100, 100)
+        self._read_colorcor_vars(current)
         current.thumb_cache = None
         self.render_thumbnails()
         self.render_preview()
         self.set_progress(self.progress_var.get(), "Настройки цветокора сохранены для текущего кадра")
 
     def reset_color_settings(self) -> None:
+        self._updating_controls = True
         self.profile_var.set(STANDARD_PROFILE)
+        self.exposure_var.set(STANDARD_EXPOSURE)
         self.contrast_var.set(STANDARD_CONTRAST)
         self.shadows_var.set(STANDARD_SHADOWS)
+        self.highlights_var.set(STANDARD_HIGHLIGHTS)
+        self.blacks_var.set(STANDARD_BLACKS)
+        self.saturation_var.set(STANDARD_SATURATION)
         self.temperature_var.set(STANDARD_TEMPERATURE)
         self.tint_var.set(STANDARD_TINT)
+        self._updating_controls = False
         self.update_current()
-        current = self.current()
-        if current:
-            current.profile = STANDARD_PROFILE
-            current.contrast = STANDARD_CONTRAST
-            current.shadows = STANDARD_SHADOWS
-            current.temperature = STANDARD_TEMPERATURE
-            current.tint = STANDARD_TINT
-            current.thumb_cache = None
         self.render_thumbnails()
         self.render_preview()
         self.set_progress(self.progress_var.get(), "Настройки цветокора сброшены")
@@ -3037,8 +3335,12 @@ class AutoRawGui(tk.Tk):
             return
         for state in frames:
             state.profile = current.profile
+            state.exposure = current.exposure
             state.contrast = current.contrast
             state.shadows = current.shadows
+            state.highlights = current.highlights
+            state.blacks = current.blacks
+            state.saturation = current.saturation
             state.temperature = current.temperature
             state.tint = current.tint
             state.thumb_cache = None
@@ -3050,23 +3352,24 @@ class AutoRawGui(tk.Tk):
         if not rule or rule.manual_only:
             return
 
-        sx = PREVIEW_SIZE[0] / CANVAS_SIZE[0]
-        sy = PREVIEW_SIZE[1] / CANVAS_SIZE[1]
+        display_w, display_h = self._preview_display_size()
+        sx = display_w / CANVAS_SIZE[0]
+        sy = display_h / CANVAS_SIZE[1]
         blue = "#008cff"
 
         if rule.x_px is not None and rule.mode == "width":
             left = rule.x_px * sx
             right = (rule.x_px + rule.target_px) * sx
-            self.preview.create_line(left, 0, left, PREVIEW_SIZE[1], fill=blue, width=2)
-            self.preview.create_line(right, 0, right, PREVIEW_SIZE[1], fill=blue, width=2)
+            self.preview.create_line(left, 0, left, display_h, fill=blue, width=2)
+            self.preview.create_line(right, 0, right, display_h, fill=blue, width=2)
 
         if rule.y_top_px is not None:
             y = rule.y_top_px * sy
-            self.preview.create_line(0, y, PREVIEW_SIZE[0], y, fill=blue, width=2)
+            self.preview.create_line(0, y, display_w, y, fill=blue, width=2)
 
         if rule.y_bottom_px is not None:
             y = (CANVAS_SIZE[1] - rule.y_bottom_px) * sy
-            self.preview.create_line(0, y, PREVIEW_SIZE[0], y, fill=blue, width=2)
+            self.preview.create_line(0, y, display_w, y, fill=blue, width=2)
 
     # ── hotkeys dialog ───────────────────────────────────────────────
     # ── image extensions for reference scanning ───────────────────────
@@ -3912,7 +4215,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
 - Предпросмотр кадра в реальном времени
 - Настройка позиции (X/Y), масштаба и поворота
 - Автодетекция товара на снимке
-- Цветокоррекция: контраст, тени, температура, оттенок
+- Цветокоррекция: боковая панель (экспозиция, контраст, тени, света, чёрные, насыщенность, температура, оттенок)
 - Эталонный референс для сравнения с образцом
 - Пакетный экспорт выбранных кадров
 - Тёмная / светлая / системная тема
@@ -3949,12 +4252,14 @@ AutoRAW Compressor — инструмент пакетной обработки 
 
 **Мышь на холсте превью:**
 
-- Зажатая ЛКМ — свободное перемещение по X и Y
+- `Пробел` + зажатая ЛКМ — сдвиг рабочей зоны (курсор «ладонь»), как в Photoshop
+- Зажатая ЛКМ — свободное перемещение объекта по X и Y
 - `Alt` + ЛКМ — движение строго по оси X
 - `Shift` + ЛКМ — движение строго по оси Y
 - `Ctrl` + ЛКМ — поворот фотографии
-- Колесо мыши — масштаб ±4%
-- `Alt` + колесо — масштаб ±1% (точная настройка)
+- Колесо мыши — масштаб фото ±4%
+- `Alt` + колесо — масштаб фото ±1% (точная настройка)
+- `Ctrl` + колесо — зум рабочей зоны превью (50–250%), полосы прокрутки при увеличении
 
 **Слайдеры панели управления:**
 
@@ -3985,15 +4290,13 @@ AutoRAW Compressor — инструмент пакетной обработки 
 
 ## 5. Цветокоррекция
 
-Включите переключатель **Цветокор** в нижней панели.
-Настройте параметры слайдерами:
-- **Контраст** — от −100 до +100
-- **Тени** — от −100 до +100
-- **Температура** — от 2000 К до 10000 К
-- **Оттенок** — от −100 до +100
+Нажмите **Цветокор ▸** под слайдерами X/Y — откроется боковая панель (как в Photoshop).
+Включите переключатель в заголовке панели, настройте параметры (каждый слайдер на отдельной строке с полем значения):
+- **Экспозиция**, **контраст**, **тени**, **света**, **чёрные**, **насыщенность**, **температура**, **оттенок**
 
 `Сохранить` — применить настройки к текущему кадру.
 `Применить к папке` — скопировать настройки на все кадры папки.
+`✕` или **Скрыть ◂** — свернуть панель.
 
 ## 6. Экспорт
 
@@ -4279,6 +4582,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
 
         SECTIONS: list[tuple[str | None, list[tuple[str, str]]]] = [
             ("Холст — перемещение", [
+                ("Пробел + ЛКМ",        "Сдвиг рабочей зоны (ладонь)"),
                 ("ЛКМ (тянуть)",        "Свободное перемещение объекта"),
                 ("Alt + ЛКМ",           "Движение строго по оси X"),
                 ("Shift + ЛКМ",         "Движение строго по оси Y"),
@@ -4286,8 +4590,9 @@ AutoRAW Compressor — инструмент пакетной обработки 
                 ("← → ↑ ↓",            "Сдвиг на 1 px"),
             ]),
             ("Холст — масштаб", [
-                ("Колесо мыши",         "Зум  ±4%"),
-                ("Alt + колесо мыши",   "Точный зум  ±1%"),
+                ("Колесо мыши",         "Масштаб фото  ±4%"),
+                ("Alt + колесо мыши",   "Точный масштаб фото  ±1%"),
+                ("Ctrl + колесо мыши",  "Зум рабочей зоны превью  ±10%"),
             ]),
             ("Миниатюры", [
                 ("Клик по миниатюре",   "Выбрать кадр"),
@@ -4337,22 +4642,70 @@ AutoRAW Compressor — инструмент пакетной обработки 
     @staticmethod
     def _mod_ctrl(state: int)  -> bool: return bool(state & 0x0004)
 
+    def _typing_focus_active(self) -> bool:
+        widget = self.focus_get()
+        while widget is not None:
+            if widget.winfo_class() in ("Entry", "TEntry", "Text", "Spinbox", "TSpinbox"):
+                return True
+            widget = widget.master
+        return False
+
+    def _update_preview_cursor(self) -> None:
+        if not hasattr(self, "preview"):
+            return
+        if self._preview_panning:
+            self.preview.configure(cursor="fleur")
+        elif self._space_held:
+            self.preview.configure(cursor="hand2")
+        else:
+            self.preview.configure(cursor="")
+
+    def _preview_space_press(self, event: tk.Event) -> str | None:
+        if self._typing_focus_active():
+            return None
+        self._space_held = True
+        self._update_preview_cursor()
+        return "break"
+
+    def _preview_space_release(self, event: tk.Event) -> str | None:
+        if self._typing_focus_active():
+            return None
+        self._space_held = False
+        if not self._preview_panning:
+            self._update_preview_cursor()
+        return "break"
+
     def start_drag(self, event: tk.Event) -> None:
+        self.preview.focus_set()
+        if self._space_held:
+            self.preview.scan_mark(event.x, event.y)
+            self._preview_panning = True
+            self.drag_start = None
+            self._update_preview_cursor()
+            return
         state = self.current()
         if not state:
             return
-        self.preview.focus_set()
         self.drag_start = (event.x, event.y, state.offset_x, state.offset_y, state.rotation)
 
     def stop_drag(self, _event: tk.Event) -> None:
+        if self._preview_panning:
+            self._preview_panning = False
+            self.drag_start = None
+            self._update_preview_cursor()
+            return
         self.drag_start = None
 
     def drag_preview(self, event: tk.Event) -> None:
+        if self._preview_panning:
+            self.preview.scan_dragto(event.x, event.y, gain=1)
+            return
         if not self.drag_start:
             return
         start_x, start_y, base_x, base_y, base_rot = self.drag_start
-        scale_x = CANVAS_SIZE[0] / PREVIEW_SIZE[0]
-        scale_y = CANVAS_SIZE[1] / PREVIEW_SIZE[1]
+        display_w, display_h = self._preview_display_size()
+        scale_x = CANVAS_SIZE[0] / display_w
+        scale_y = CANVAS_SIZE[1] / display_h
         dx = (event.x - start_x) * scale_x
         dy = (event.y - start_y) * scale_y
 
@@ -4375,7 +4728,29 @@ AutoRAW Compressor — инструмент пакетной обработки 
         self.update_current()
 
     def mousewheel_zoom(self, event: tk.Event) -> None:
-        # Alt + wheel → fine step (1%); plain wheel → normal step (4%)
+        if self._mod_ctrl(event.state):
+            step = WORKSPACE_ZOOM_STEP if event.delta > 0 else -WORKSPACE_ZOOM_STEP
+            self.preview_workspace_scale = max(
+                WORKSPACE_ZOOM_MIN,
+                min(WORKSPACE_ZOOM_MAX, self.preview_workspace_scale + step),
+            )
+            self.render_preview()
+            state = self.current()
+            if state:
+                folder_text = self.selected_folder.name if self.selected_folder else ""
+                match_text = ""
+                if state.match_score is not None:
+                    confidence = max(0, min(99, int(round((1.0 - state.match_score) * 100))))
+                    match_text = f" · авто {confidence}%"
+                self.info_var.set(
+                    f"📁  {folder_text}\n"
+                    f"🖼  {state.frame}{match_text} — {state.path.name}\n"
+                    f"⌨  Стрелки / колесо · Пробел+ЛКМ — сдвиг зоны · Ctrl+колесо — "
+                    f"{int(self.preview_workspace_scale * 100)}%"
+                )
+            return
+
+        # Alt + wheel → fine image zoom (1%); plain wheel → image zoom (4%)
         if self._mod_alt(event.state):
             delta = 0.01 if event.delta > 0 else -0.01
         else:
@@ -4527,13 +4902,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
                 export_crop = frame.crop_box
                 output = render_frame(frame, CANVAS_SIZE, source_image=export_image, crop_box=export_crop)
                 if use_colorcor:
-                    output = apply_standard_look(
-                        output,
-                        contrast=frame.contrast,
-                        shadows=frame.shadows,
-                        temperature=frame.temperature,
-                        tint=frame.tint,
-                    )
+                    output = apply_frame_colorcor(output, frame)
                 output_path = output_dir / export_name
                 output.save(
                     output_path,
