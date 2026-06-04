@@ -100,7 +100,18 @@ def run_pyinstaller() -> Path:
 
 
 def _ignore_assets(_dir: str, names: list[str]) -> set[str]:
-    return {name for name in names if name in ASSET_IGNORE_NAMES or name.lower().endswith(".psd")}
+    ignored: set[str] = set()
+    for name in names:
+        lower = name.lower()
+        if (
+            name in ASSET_IGNORE_NAMES
+            or lower.endswith(".psd")
+            or lower.endswith(".nef")
+            or lower.endswith(".xmp")
+            or name == "original"
+        ):
+            ignored.add(name)
+    return ignored
 
 
 def copy_assets(target: Path) -> None:
@@ -112,7 +123,7 @@ def copy_assets(target: Path) -> None:
         dest = target / folder
         if dest.exists():
             shutil.rmtree(dest)
-        ignore = _ignore_assets if folder == "assets" else None
+        ignore = _ignore_assets if folder in ("assets", "reference") else None
         shutil.copytree(source, dest, ignore=ignore)
         print(f"Copied {folder}/ -> {dest}")
 
