@@ -1,6 +1,6 @@
 # AutoRAW Compressor
 
-**Версия: 0.0.1.12.ProtoAlpha**
+**Версия: 0.0.1.13.ProtoAlpha**
 
 Прототип массового автокадрирования для съёмки кроссовок: распознаёт товар на светлом фоне, применяет правила посадки по номеру кадра и готовит план кропа для Photoshop. Есть CLI и GUI с ручной подстройкой и экспортом.
 
@@ -145,7 +145,7 @@ python build\publish_gitverse_release.py
 
 В приложении: **Справка → Проверить обновление…** — скачивание, прогресс, распаковка в папку exe и перезапуск.
 
-Имя ZIP: `AutoRAWCompressor-0.0.1.12.ProtoAlpha.zip`. Настройки пользователя и `zona/data.dat` при обновлении сохраняются.
+Имя ZIP: `AutoRAWCompressor-0.0.1.13.ProtoAlpha.zip`. Настройки пользователя и `zona/data.dat` при обновлении сохраняются.
 
 **Защитник Windows / SmartScreen:** неподписанный PyInstaller-exe и скрипт установки обновления могут вызывать предупреждение. Это ожидаемо: «Подробнее» → «Выполнить в любом случае», либо добавьте папку `AutoRAWCompressor` в исключения Защитника. Цифровая подпись exe планируется отдельно.
 
@@ -183,7 +183,7 @@ Remote: `gitverse` → `https://gitverse.ru/delbraun/AutoRAWCompressor.git`
 | `W` | `VERSION_PATCH` | Мелкие исправления и мелкие нововведения |
 | Codename | `VERSION_CODENAME` | Название сборки (`ProtoAlpha`, …) |
 
-Строка версии: `X.Y.Z.W.Codename` (сейчас **0.0.1.12.ProtoAlpha**).
+Строка версии: `X.Y.Z.W.Codename` (сейчас **0.0.1.13.ProtoAlpha**).
 
 Отображается в заголовке GUI, `--version` CLI, меню `build.bat` и `dist/README.txt` после сборки.
 

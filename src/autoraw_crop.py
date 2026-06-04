@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Iterable
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 
 from app_paths import resource_path
 from version import APP_NAME, VERSION, version_string
@@ -183,11 +183,11 @@ def open_preview(path: Path, max_side: int = 1200) -> Image.Image:
         else:
             img = Image.open(path)
             img.load()
-            img = img.convert("RGB")
+            img = ImageOps.exif_transpose(img).convert("RGB")
     else:
         img = Image.open(path)
         img.load()
-        img = img.convert("RGB")
+        img = ImageOps.exif_transpose(img).convert("RGB")
 
     if max_side and max(img.size) > max_side:
         img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
@@ -578,13 +578,15 @@ def draw_debug(img: Image.Image, object_box: Box | None, crop_box: Box | None) -
 
 
 def save_layout_preview(img: Image.Image, crop_box: Box | None, output_path: Path) -> None:
-    if not crop_box:
-        img.copy().resize(CANVAS_SIZE, Image.Resampling.BICUBIC).save(output_path, quality=88)
-        return
-
-    cropped = img.crop((crop_box.left, crop_box.top, crop_box.right, crop_box.bottom))
-    cropped = cropped.resize(CANVAS_SIZE, Image.Resampling.BICUBIC)
-    cropped.save(output_path, quality=88)
+    src = img.crop((crop_box.left, crop_box.top, crop_box.right, crop_box.bottom)) if crop_box else img
+    # Fit into CANVAS_SIZE preserving aspect ratio; letterbox with white.
+    thumb = src.copy()
+    thumb.thumbnail(CANVAS_SIZE, Image.Resampling.LANCZOS)
+    canvas = Image.new("RGB", CANVAS_SIZE, (255, 255, 255))
+    paste_x = (CANVAS_SIZE[0] - thumb.width) // 2
+    paste_y = (CANVAS_SIZE[1] - thumb.height) // 2
+    canvas.paste(thumb, (paste_x, paste_y))
+    canvas.save(output_path, quality=88)
 
 
 def process_file(path: Path, output_dir: Path, aspect: float, padding: float) -> CropResult:

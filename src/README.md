@@ -1,6 +1,6 @@
 ﻿# AutoRAW Compressor — техническое описание
 
-**Версия: 0.0.1.12.ProtoAlpha** (источник: [`version.py`](version.py))
+**Версия: 0.0.1.13.ProtoAlpha** (источник: [`version.py`](version.py))
 
 Прототип массового автокадрирования для съемки кроссовок.
 

@@ -257,13 +257,13 @@ SEARCH_REFERENCE_DIR = REFERENCE_DIR / "search"
 WORKING_MAX_SIDE = 2600
 STANDARD_PROFILE = "Adobe Стандарт"
 STANDARD_EXPOSURE = 0
-STANDARD_CONTRAST = 18
-STANDARD_SHADOWS = 14
-STANDARD_HIGHLIGHTS = -8
-STANDARD_BLACKS = -6
-STANDARD_SATURATION = 6
-STANDARD_TEMPERATURE = 6650
-STANDARD_TINT = 5
+STANDARD_CONTRAST = -3
+STANDARD_SHADOWS = 7
+STANDARD_HIGHLIGHTS = 0
+STANDARD_BLACKS = 8
+STANDARD_SATURATION = 0
+STANDARD_TEMPERATURE = 5017
+STANDARD_TINT = 0
 DROPLETS_DIR = resource_path("droplets")
 DROPLET_BY_FRAME = {
     "01": "01_drop.exe",
@@ -1927,7 +1927,7 @@ class AutoRawGui(tk.Tk):
         self.saturation_var = tk.IntVar(value=STANDARD_SATURATION)
         self.temperature_var = tk.IntVar(value=STANDARD_TEMPERATURE)
         self.tint_var = tk.IntVar(value=STANDARD_TINT)
-        self.use_colorcor_var = tk.BooleanVar(value=False)
+        self.use_colorcor_var = tk.BooleanVar(value=True)
 
     def _build_colorcor_drawer(self, body: tk.Frame) -> None:
         self.colorcor_drawer = tk.Frame(body, bg=FIG_PANEL, width=COLORCOR_PANEL_W)
@@ -3898,7 +3898,7 @@ class AutoRawGui(tk.Tk):
             )
             return
         try:
-            img = Image.open(path)
+            img = ImageOps.exif_transpose(Image.open(path))
             img = ImageOps.fit(img, (self._ref_w, self._ref_h), Image.LANCZOS)
             self._ref_photo = ImageTk.PhotoImage(img)
             self.ref_canvas.create_image(0, 0, image=self._ref_photo, anchor=tk.NW)
