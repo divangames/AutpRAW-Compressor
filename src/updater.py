@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import tempfile
 import urllib.error
 import urllib.request
@@ -400,11 +401,10 @@ def extract_zip(zip_path: Path, dest_dir: Path, on_progress: ProgressCallback | 
 
 def _write_apply_script(*, stage_dir: Path, target_dir: Path, pid: int, exe_name: str) -> Path:
     script = user_config_dir() / "apply_update.bat"
-    log_path = target_dir / "_update_cache" / "apply.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path = user_config_dir() / "apply_update.log"
     stage = str(stage_dir.resolve())
     target = str(target_dir.resolve())
-    cache_parent = str(stage_dir.parent.resolve())
+    cache_dir = str((target_dir / "_update_cache").resolve())
     # ui_config.json и секреты не перезаписываем
     content = f"""@echo off
 setlocal EnableExtensions
@@ -412,24 +412,37 @@ set "PID={pid}"
 set "STAGE={stage}"
 set "TARGET={target}"
 set "LOG={log_path}"
+set "CACHE={cache_dir}"
 set "EXE={exe_name}"
 
-echo [%date% %time%] update start PID=%PID%>>"%LOG%"
+echo [%date% %time%] update start PID=%PID% STAGE=%STAGE% TARGET=%TARGET%>>"%LOG%"
 
 :wait_app
-tasklist /FI "PID eq %PID%" 2>nul | find "%PID%" >nul
-if not errorlevel 1 (
+powershell -NoProfile -Command "exit([int]!!(Get-Process -Id {pid} -ErrorAction SilentlyContinue))" 2>nul
+if %ERRORLEVEL% NEQ 0 (
     ping -n 2 127.0.0.1 >nul
     goto wait_app
 )
 echo [%date% %time%] app exited>>"%LOG%"
+ping -n 4 127.0.0.1 >nul
 
 if exist "%TARGET%\\zona\\data.dat" copy /Y "%TARGET%\\zona\\data.dat" "%TEMP%\\autoraw_data.dat.bak" >nul
 
-robocopy "%STAGE%" "%TARGET%" /E /XD "_update_cache" /XF "ui_config.json" /IS /IT /R:5 /W:2 /NFL /NDL /NJH /NJS >>"%LOG%" 2>&1
+set "TRY=0"
+:copy_retry
+set /a TRY+=1
+echo [%date% %time%] robocopy try %TRY%>>"%LOG%"
+robocopy "%STAGE%" "%TARGET%" /E /XD "_update_cache" /XF "ui_config.json" /IS /IT /R:8 /W:3 /NFL /NDL /NJH /NJS >>"%LOG%" 2>&1
 set "RC=%ERRORLEVEL%"
 echo [%date% %time%] robocopy exit %RC%>>"%LOG%"
-if %RC% GEQ 8 exit /b %RC%
+if %RC% GEQ 8 (
+    if %TRY% LSS 5 (
+        ping -n 3 127.0.0.1 >nul
+        goto copy_retry
+    )
+    echo [%date% %time%] FAILED robocopy>>"%LOG%"
+    exit /b %RC%
+)
 
 if exist "%TEMP%\\autoraw_data.dat.bak" (
     if not exist "%TARGET%\\zona" mkdir "%TARGET%\\zona"
@@ -439,14 +452,41 @@ if exist "%TEMP%\\autoraw_data.dat.bak" (
 if exist "%TARGET%\\%EXE%" (
     start "" /D "%TARGET%" "%TARGET%\\%EXE%"
     echo [%date% %time%] restarted>>"%LOG%"
+) else (
+    echo [%date% %time%] ERROR exe missing>>"%LOG%"
 )
 
-rd /s /q "{cache_parent}" 2>nul
+rd /s /q "%CACHE%" 2>nul
+rd /s /q "%STAGE%" 2>nul
 del /f /q "%~f0" 2>nul
 exit /b 0
 """
     script.write_text(content, encoding="cp866")
     return script
+
+
+def _launch_apply_script(script: Path, target: Path) -> None:
+    """Запуск bat в отдельном процессе — не должен завершаться вместе с GUI при os._exit."""
+    if sys.platform == "win32":
+        try:
+            os.startfile(script)  # type: ignore[attr-defined]
+            return
+        except OSError:
+            pass
+        flags = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            | 0x01000000  # CREATE_BREAKAWAY_FROM_JOB
+        )
+        subprocess.Popen(
+            ["cmd.exe", "/c", str(script)],
+            cwd=str(target),
+            creationflags=flags,
+            close_fds=True,
+        )
+        return
+    subprocess.Popen(["/bin/sh", str(script)], cwd=str(target), close_fds=True)
 
 
 def apply_update_and_restart(stage_dir: Path) -> None:
@@ -460,16 +500,9 @@ def apply_update_and_restart(stage_dir: Path) -> None:
         pid=pid,
         exe_name=exe_name,
     )
-    creationflags = 0
-    if sys.platform == "win32":
-        creationflags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
-    subprocess.Popen(
-        ["cmd.exe", "/c", str(script)],
-        cwd=str(target),
-        creationflags=creationflags,
-        close_fds=True,
-    )
+    _launch_apply_script(script, target)
+    # Дать cmd стартовать до выхода процесса (иначе дочерний bat мог обрываться).
+    time.sleep(0.8)
     # sys.exit() из потока загрузки не закрывает Tk — процесс остаётся, bat висит на :wait_app.
     os._exit(0)
 
@@ -491,7 +524,6 @@ def run_update(
 
     zip_path = cache / info.asset_name
     extract_dir = cache / "extracted"
-    stage_dir = cache / "stage"
 
     if on_progress:
         on_progress("download", 0, f"Скачиваем {info.asset_name}…")
@@ -503,10 +535,12 @@ def run_update(
 
     if on_progress:
         on_progress("apply", 0, "Подготовка к установке…")
-    if stage_dir.exists():
-        shutil.rmtree(stage_dir)
-    shutil.copytree(root, stage_dir)
+    # Стадия вне папки exe — bat копирует оттуда; при сбое не мешает _update_cache.
+    external_stage = user_config_dir() / "update_stage"
+    if external_stage.exists():
+        shutil.rmtree(external_stage, ignore_errors=True)
+    shutil.copytree(root, external_stage)
 
     if on_progress:
         on_progress("apply", 100, "Перезапуск приложения…")
-    apply_update_and_restart(stage_dir)
+    apply_update_and_restart(external_stage)

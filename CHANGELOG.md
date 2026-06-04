@@ -2,6 +2,14 @@
 
 Формат версий: `X.Y.Z.W.Codename` — см. [`src/version.py`](src/version.py).
 
+## [0.0.1.14.ProtoAlpha] — 2026-06-04
+
+### Автообновление
+
+- Исправлена установка: `apply_update.bat` запускается через `os.startfile` и не обрывается при выходе GUI.
+- Файлы обновления копируются из `%LOCALAPPDATA%\AutoRAWCompressor\update_stage` (robocopy с повторами).
+- Лог установки: `%LOCALAPPDATA%\AutoRAWCompressor\apply_update.log`.
+
 ## [0.0.1.13.ProtoAlpha] — 2026-06-04
 
 ### Исправления (пропорции и превью)
