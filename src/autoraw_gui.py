@@ -552,8 +552,20 @@ def render_frame(
 
     viewport_w = max(1.0, box.width / zoom)
     viewport_h = max(1.0, box.height / zoom)
-    scale_src_x = viewport_w / size[0]
-    scale_src_y = viewport_h / size[1]
+
+    # Единый масштаб по X и Y — иначе при crop_box с аспектом != аспект холста
+    # (например, когда кроп упёрся в край исходника и был обрезан clamp) кадр
+    # растягивается. Расширяем недостающую сторону вьюпорта до аспекта холста,
+    # чтобы scale_src_x == scale_src_y и деформация была невозможна на любом
+    # экране/разрешении.
+    target_ar = size[0] / size[1]
+    if viewport_w / viewport_h > target_ar:
+        viewport_h = viewport_w / target_ar
+    else:
+        viewport_w = viewport_h * target_ar
+    scale_src = viewport_w / size[0]
+    scale_src_x = scale_src
+    scale_src_y = scale_src
 
     base_cx = (box.left + box.right) / 2.0
     base_cy = (box.top + box.bottom) / 2.0
