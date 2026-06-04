@@ -91,7 +91,7 @@ LAYOUT_RULES = {
         expand_left=0.15,
         expand_top=0.18,
         expand_right=0.45,
-        expand_bottom=0.18,
+        expand_bottom=0.0,   # стол снизу — не тянуть рамку вниз
     ),
     "02": LayoutRule("rules/2-3-4-8.jpg", "width", target_px=965, x_px=223, y_bottom_px=265),
     "03": LayoutRule(
@@ -103,7 +103,7 @@ LAYOUT_RULES = {
         expand_left=0.10,
         expand_top=0.12,
         expand_right=0.25,
-        expand_bottom=0.12,
+        expand_bottom=0.0,   # стол снизу
     ),
     "04": LayoutRule(
         "rules/2-3-4-8.jpg",
@@ -114,7 +114,7 @@ LAYOUT_RULES = {
         expand_left=0.20,
         expand_top=0.12,
         expand_right=0.35,
-        expand_bottom=0.12,
+        expand_bottom=0.0,   # стол снизу
     ),
     "05": LayoutRule("manual: insoles top view", "manual", target_px=0, manual_only=True),
     "06": LayoutRule("rules/6.jpg", "height", target_px=897, y_top_px=76, y_bottom_px=76, combine_components=True),
@@ -365,7 +365,7 @@ def compute_auto_crop_box(path: Path, img: Image.Image, aspect: float) -> Box:
 
     if object_box and rule and not rule.manual_only:
         layout_box = expand_box(object_box, img.size, rule)
-        return crop_from_rule(layout_box, img.size, aspect, rule)
+        return crop_from_rule(layout_box, img.size, aspect, rule, raw_box=object_box)
 
     if object_box:
         return crop_from_object(object_box, img.size, aspect, padding=0.11)
@@ -388,7 +388,9 @@ def detect_object(img: Image.Image, combine_components: bool = False) -> tuple[B
     mask &= dark_or_colored
 
     mask[:3, :] = False
-    mask[int(mask.shape[0] * 0.9) :, :] = False
+    # Нижняя граница — 82% высоты: стол/тень снизу часто занимают 15-30% и
+    # уводят bbox вниз, сдвигая объект вверх в финальном кадре.
+    mask[int(mask.shape[0] * 0.82) :, :] = False
     mask[:, :2] = False
     mask[:, -2:] = False
     mask = clean_mask(mask)
@@ -467,7 +469,15 @@ def shift_inside(left: float, top: float, width: float, height: float, image_w: 
     return max(0.0, left), max(0.0, top)
 
 
-def crop_from_rule(box: Box, image_size: tuple[int, int], aspect: float, rule: LayoutRule) -> Box:
+def crop_from_rule(
+    box: Box,
+    image_size: tuple[int, int],
+    aspect: float,
+    rule: LayoutRule,
+    raw_box: "Box | None" = None,
+) -> "Box":
+    """raw_box — оригинальный bbox объекта до expand; используется для y_bottom_px
+    чтобы не смещать кроп вниз из-за expand_bottom на стол/тень."""
     image_w, image_h = image_size
     canvas_w, canvas_h = CANVAS_SIZE
 
@@ -479,7 +489,10 @@ def crop_from_rule(box: Box, image_size: tuple[int, int], aspect: float, rule: L
         left = box.left - object_left_on_canvas / scale
 
         if rule.y_bottom_px is not None:
-            top = box.bottom - (canvas_h - rule.y_bottom_px) / scale
+            # Позиционируем по нижней границе RAW-объекта (до expand), иначе
+            # expand_bottom тянет кроп вниз на стол и кроссовок уходит вверх.
+            anchor_bottom = raw_box.bottom if raw_box is not None else box.bottom
+            top = anchor_bottom - (canvas_h - rule.y_bottom_px) / scale
         else:
             top = ((box.top + box.bottom) / 2) - (canvas_h / 2) / scale
 
@@ -600,7 +613,7 @@ def process_file(path: Path, output_dir: Path, aspect: float, padding: float) ->
         crop_box = None
         status = "manual_only"
     elif layout_box and rule:
-        crop_box = crop_from_rule(layout_box, img.size, aspect, rule)
+        crop_box = crop_from_rule(layout_box, img.size, aspect, rule, raw_box=object_box)
         status = "ok" if confidence >= 0.18 else "needs_review"
     else:
         crop_box = crop_from_object(object_box, img.size, aspect, padding) if object_box else None
