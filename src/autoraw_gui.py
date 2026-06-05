@@ -38,7 +38,7 @@ try:
 except Exception:
     windnd = None
 
-from PIL import Image, ImageEnhance, ImageOps, ImageTk
+from PIL import Image, ImageCms, ImageEnhance, ImageOps, ImageTk
 
 from app_paths import ensure_ui_config, resource_path, ui_config_path
 from version import APP_NAME, APP_TITLE, version_string
@@ -518,6 +518,27 @@ def fit_image(img: Image.Image, size: tuple[int, int]) -> Image.Image:
     top = (size[1] - fitted.height) // 2
     canvas.paste(fitted, (left, top))
     return canvas
+
+
+_SRGB_ICC_CACHE: bytes | None = None
+
+
+def _srgb_icc_profile() -> bytes:
+    """Байты sRGB ICC-профиля для встраивания в экспорт.
+
+    Без профиля цветоуправляемые просмотрщики (Windows Photos, браузеры) и
+    мониторы с широким охватом показывают JPEG контрастнее/насыщеннее, чем
+    неуправляемое превью в приложении. Явный sRGB убирает это расхождение.
+    """
+    global _SRGB_ICC_CACHE
+    if _SRGB_ICC_CACHE is None:
+        try:
+            _SRGB_ICC_CACHE = ImageCms.ImageCmsProfile(
+                ImageCms.createProfile("sRGB")
+            ).tobytes()
+        except Exception:
+            _SRGB_ICC_CACHE = b""
+    return _SRGB_ICC_CACHE
 
 
 def render_frame(
@@ -4954,14 +4975,17 @@ AutoRAW Compressor — инструмент пакетной обработки 
                 if use_colorcor:
                     output = apply_frame_colorcor(output, frame)
                 output_path = output_dir / export_name
-                output.save(
-                    output_path,
+                save_kwargs = dict(
                     format="JPEG",
                     quality=98,
                     subsampling=0,
                     optimize=False,
                     progressive=True,
                 )
+                icc = _srgb_icc_profile()
+                if icc:
+                    save_kwargs["icc_profile"] = icc
+                output.save(output_path, **save_kwargs)
                 exported_for_droplets.append((output_path, frame.frame))
                 exported += 1
                 done_units += 1
