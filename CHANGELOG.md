@@ -2,6 +2,13 @@
 
 Формат версий: `X.Y.Z.W.Codename` — см. [`src/version.py`](src/version.py).
 
+## [0.0.1.18.ProtoAlpha] — 2026-06-05
+
+### Автообновление
+
+- Исправлена проверка обновлений при сбоях SSL к `api.gitverse.ru` на Windows: повторы запроса, CA через `certifi`, fallback на `curl --ssl-no-revoke` и PowerShell.
+- Вместо технического `UNEXPECTED_EOF_WHILE_READING` показывается понятное сообщение о сетевой ошибке и ссылка на Releases.
+
 ## [0.0.1.17.ProtoAlpha] — 2026-06-05
 
 ### Дроплеты (`droplets/`)

@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import time
@@ -86,6 +87,136 @@ def _api_headers(token: str) -> dict[str, str]:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return headers
+
+
+def _ssl_context() -> ssl.SSLContext:
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+def _is_transient_network_error(exc: BaseException) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    msg = str(exc).lower()
+    needles = (
+        "unexpected_eof",
+        "ssl",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection was reset",
+        "connection was aborted",
+        "failed to establish",
+        "could not connect",
+        "10060",
+        "10054",
+        "connection refused",
+        "handshake",
+    )
+    return any(needle in msg for needle in needles)
+
+
+def _network_error_message() -> str:
+    return (
+        "Не удалось связаться с GitVerse (ошибка SSL или сети).\n\n"
+        "Проверьте интернет и повторите через минуту. "
+        f"Обновление можно скачать вручную:\n{RELEASES_PAGE}"
+    )
+
+
+def _curl_exe() -> Path:
+    return Path(r"C:\Windows\System32\curl.exe")
+
+
+def _http_get_via_curl(url: str, headers: dict[str, str], timeout: int) -> bytes:
+    curl = _curl_exe()
+    if not curl.is_file():
+        raise RuntimeError("curl.exe не найден")
+    args = [
+        str(curl),
+        "-fsS",
+        "--ssl-no-revoke",
+        "--retry",
+        "3",
+        "--retry-delay",
+        "2",
+        "--max-time",
+        str(max(5, timeout)),
+    ]
+    for key, value in headers.items():
+        args.extend(["-H", f"{key}: {value}"])
+    args.append(url)
+    proc = subprocess.run(args, capture_output=True, timeout=timeout + 20)
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or b"")[-500:].decode("utf-8", errors="replace")
+        raise RuntimeError(tail)
+    return proc.stdout
+
+
+def _http_get_via_powershell(url: str, headers: dict[str, str], timeout: int) -> bytes:
+    if sys.platform != "win32":
+        raise RuntimeError("PowerShell недоступен")
+    esc = lambda text: text.replace("'", "''")
+    header_parts = [f"'{esc(key)}' = '{esc(value)}'" for key, value in headers.items()]
+    headers_expr = "{" + "; ".join(header_parts) + "}" if header_parts else "@{}"
+    ps = (
+        f"$ProgressPreference='SilentlyContinue'; "
+        f"$headers = {headers_expr}; "
+        f"$r = Invoke-WebRequest -Uri '{esc(url)}' -Headers $headers "
+        f"-TimeoutSec {max(5, timeout)} -UseBasicParsing; "
+        f"[Console]::Out.Write($r.Content)"
+    )
+    proc = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", ps],
+        capture_output=True,
+        timeout=timeout + 25,
+    )
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or b"")[-500:].decode("utf-8", errors="replace")
+        raise RuntimeError(tail)
+    if not proc.stdout:
+        raise RuntimeError("Пустой ответ GitVerse")
+    return proc.stdout
+
+
+def _http_get_bytes(
+    url: str,
+    headers: dict[str, str] | None = None,
+    *,
+    timeout: int = 30,
+    retries: int = 4,
+) -> bytes:
+    """GET с повторами и fallback (curl/PowerShell) при сбоях SSL на Windows."""
+    hdrs = dict(headers or {})
+    hdrs.setdefault("User-Agent", "AutoRAWCompressor")
+    last_err: Exception | None = None
+
+    for attempt in range(retries):
+        if attempt:
+            time.sleep(min(1.5 * attempt, 6.0))
+        try:
+            req = urllib.request.Request(url, headers=hdrs)
+            with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
+                return resp.read()
+        except urllib.error.HTTPError:
+            raise
+        except Exception as exc:
+            last_err = exc
+            if not _is_transient_network_error(exc):
+                raise
+
+    if sys.platform == "win32":
+        for func in (_http_get_via_curl, _http_get_via_powershell):
+            try:
+                return func(url, hdrs, timeout)
+            except Exception as exc:
+                last_err = exc
+
+    raise RuntimeError(_network_error_message()) from last_err
 
 
 def _package_asset_name(version: str) -> str:
@@ -183,10 +314,9 @@ def _fetch_releases_json(token: str) -> list:
         "Accept": "application/vnd.gitverse.object+json;version=1",
         "User-Agent": "AutoRAWCompressor",
     }
-    req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        raw = _http_get_bytes(url, headers, timeout=20)
+        data = json.loads(raw.decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
             if token:
@@ -305,6 +435,11 @@ def _download_via_curl(url: str, dest: Path, token: str) -> None:
         [
             str(curl),
             "-fSL",
+            "--ssl-no-revoke",
+            "--retry",
+            "3",
+            "--retry-delay",
+            "2",
             "--user",
             f"{GITVERSE_OWNER}:{token}",
             "-o",
@@ -339,18 +474,27 @@ def download_file(
         header_attempts.append(_api_headers(token))
 
     last_http: urllib.error.HTTPError | None = None
+    last_network: Exception | None = None
     for headers in header_attempts:
-        try:
-            req = urllib.request.Request(url, headers=headers or {})
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                _download_stream(resp, dest, on_progress, total_hint)
-            if on_progress:
-                on_progress("download", 100.0, "Загрузка завершена")
-            return
-        except urllib.error.HTTPError as exc:
-            last_http = exc
-            if exc.code not in (401, 403):
-                raise RuntimeError(f"Ошибка загрузки: HTTP {exc.code}") from exc
+        for attempt in range(3):
+            if attempt:
+                time.sleep(min(1.5 * attempt, 4.0))
+            try:
+                req = urllib.request.Request(url, headers=headers or {})
+                with urllib.request.urlopen(req, timeout=120, context=_ssl_context()) as resp:
+                    _download_stream(resp, dest, on_progress, total_hint)
+                if on_progress:
+                    on_progress("download", 100.0, "Загрузка завершена")
+                return
+            except urllib.error.HTTPError as exc:
+                last_http = exc
+                if exc.code not in (401, 403):
+                    raise RuntimeError(f"Ошибка загрузки: HTTP {exc.code}") from exc
+                break
+            except Exception as exc:
+                last_network = exc
+                if not _is_transient_network_error(exc):
+                    raise RuntimeError(f"Ошибка загрузки: {exc}") from exc
 
     if sys.platform == "win32" and "/api/packages/" in url:
         try:
@@ -366,10 +510,14 @@ def download_file(
                     "Не удалось скачать обновление (401). Установите официальную сборку dist "
                     "или обновите приложение вручную с GitVerse Releases."
                 ) from exc
+            if last_network is not None and _is_transient_network_error(last_network):
+                raise RuntimeError(_network_error_message()) from last_network
             raise
 
     if last_http is not None:
         raise RuntimeError(f"Ошибка загрузки: HTTP {last_http.code}") from last_http
+    if last_network is not None:
+        raise RuntimeError(_network_error_message()) from last_network
     raise RuntimeError("Не удалось скачать обновление.")
 
 
