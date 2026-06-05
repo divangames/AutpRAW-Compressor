@@ -3379,6 +3379,14 @@ class AutoRawGui(tk.Tk):
             y = (CANVAS_SIZE[1] - rule.y_bottom_px) * sy
             self.preview.create_line(0, y, display_w, y, fill=blue, width=2)
 
+        if frame == "06":
+            cx = display_w / 2.0
+            cy = display_h / 2.0
+            half = 12.0 * min(sx, sy)
+            red = "#ff0000"
+            self.preview.create_line(cx - half, cy, cx + half, cy, fill=red, width=2)
+            self.preview.create_line(cx, cy - half, cx, cy + half, fill=red, width=2)
+
     # ── hotkeys dialog ───────────────────────────────────────────────
     # ── image extensions for reference scanning ───────────────────────
     _IMG_EXTS: frozenset[str] = frozenset(
