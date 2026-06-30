@@ -1,4 +1,4 @@
-"""Общие функции для сборки установщиков (MSIX и др.)."""
+"""Общие функции для сборки установщиков (MSIX, MSI и др.)."""
 from __future__ import annotations
 
 import re
@@ -76,5 +76,7 @@ def ensure_dist() -> None:
         run_build_dist()
     if not (DIST_DIR / "droplets").is_dir():
         raise FileNotFoundError(f"Missing droplets in dist: {DIST_DIR / 'droplets'}")
+    if not (DIST_DIR / "AutoAction" / "AutoAction-GUI.exe").is_file():
+        raise FileNotFoundError(f"Missing AutoAction in dist: {DIST_DIR / 'AutoAction' / 'AutoAction-GUI.exe'}")
     if not (DIST_DIR / "CHANGELOG.md").is_file():
         raise FileNotFoundError(f"Missing CHANGELOG.md in dist: {DIST_DIR / 'CHANGELOG.md'}")

@@ -18,10 +18,11 @@ WORK_DIR = ROOT / "build" / "pyinstaller"
 STAGING = ROOT / "build" / "_staging"
 SPEC = ROOT / "build" / "AutoRAW.spec"
 CLI_SPEC = ROOT / "build" / "AutoRAW-CLI.spec"
+AA_SPEC = ROOT / "build" / "AutoAction-GUI.spec"
 
 ASSET_DIRS = ("reference", "rules", "color", "assets", "droplets")
 # Не копировать в dist — нужны только при сборке MSIX / разработке.
-ASSET_IGNORE_NAMES = {"icon.psd", "setup.png", "installer_banner.png"}
+ASSET_IGNORE_NAMES = {"icon.psd", "setup.png", "installer_banner.png", "icon_setup.ico", "icon_setup.png"}
 BUILTIN_TOKEN_PATH = SRC / "builtin_gitverse_read_token.py"
 
 
@@ -96,6 +97,30 @@ def run_pyinstaller() -> Path:
     if not cli_exe.exists():
         raise FileNotFoundError(f"CLI build not found: {cli_exe}")
     shutil.copy2(cli_exe, built / "AutoRAW-Crop.exe")
+
+    aa_staging = STAGING / "aa_onefile"
+    aa_staging.mkdir(parents=True, exist_ok=True)
+    aa_cmd = [
+        sys.executable,
+        "-m",
+        "PyInstaller",
+        "--noconfirm",
+        "--clean",
+        f"--distpath={aa_staging}",
+        f"--workpath={WORK_DIR / 'autoaction'}",
+        str(AA_SPEC),
+    ]
+    print("Running AutoAction onefile:", " ".join(aa_cmd))
+    subprocess.check_call(aa_cmd, cwd=ROOT)
+
+    aa_exe = aa_staging / "AutoAction-GUI.exe"
+    if not aa_exe.exists():
+        raise FileNotFoundError(f"AutoAction build not found: {aa_exe}")
+    aa_dest = built / "AutoAction"
+    aa_dest.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(aa_exe, aa_dest / "AutoAction-GUI.exe")
+    print(f"Copied AutoAction-GUI.exe -> {aa_dest / 'AutoAction-GUI.exe'}")
+
     return built
 
 
@@ -114,6 +139,25 @@ def _ignore_assets(_dir: str, names: list[str]) -> set[str]:
     return ignored
 
 
+def _ignore_reference(_dir: str, names: list[str]) -> set[str]:
+    """Copy reference/; inside Sneakers/original keep only etalon/."""
+    ignored: set[str] = set()
+    for name in names:
+        lower = name.lower()
+        if (
+            name in ASSET_IGNORE_NAMES
+            or lower.endswith(".psd")
+            or lower.endswith(".nef")
+            or lower.endswith(".xmp")
+        ):
+            ignored.add(name)
+    if Path(_dir).name == "original":
+        for name in names:
+            if name != "etalon":
+                ignored.add(name)
+    return ignored
+
+
 def copy_assets(target: Path) -> None:
     for folder in ASSET_DIRS:
         source = ROOT / folder
@@ -123,9 +167,28 @@ def copy_assets(target: Path) -> None:
         dest = target / folder
         if dest.exists():
             shutil.rmtree(dest)
-        ignore = _ignore_assets if folder in ("assets", "reference") else None
+        ignore = _ignore_reference if folder == "reference" else (
+            _ignore_assets if folder == "assets" else None
+        )
         shutil.copytree(source, dest, ignore=ignore)
         print(f"Copied {folder}/ -> {dest}")
+
+
+ETALON_DIST_DIR = Path("reference") / "Sneakers" / "original" / "etalon"
+
+
+def verify_etalon_assets(target: Path) -> None:
+    """Эталоны GUI должны попасть в portable-сборку."""
+    etalon_dir = target / ETALON_DIST_DIR
+    if not etalon_dir.is_dir():
+        raise FileNotFoundError(f"Etalon folder missing in dist: {etalon_dir}")
+    images = sorted(
+        f for f in etalon_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp"}
+    )
+    if not images:
+        raise FileNotFoundError(f"No etalon images in dist: {etalon_dir}")
+    print(f"Etalon OK: {len(images)} file(s) -> {etalon_dir}")
 
     changelog = ROOT / "CHANGELOG.md"
     if changelog.is_file():
@@ -179,6 +242,19 @@ def write_launchers(target: Path) -> None:
         encoding="utf-8",
     )
 
+    (target / "run_autoaction.bat").write_text(
+        "\n".join(
+            [
+                "@echo off",
+                "setlocal",
+                'cd /d "%~dp0"',
+                'start "" "%~dp0AutoAction\\AutoAction-GUI.exe" %*',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
     (target / "README.txt").write_text(
         "\n".join(
             [
@@ -190,8 +266,12 @@ def write_launchers(target: Path) -> None:
                 "  run_gui.bat       — то же (можно перетащить папку на bat)",
                 "  AutoRAW-Crop.exe  — пакетная обработка (CLI)",
                 "  run_autocrop.bat  — пример CLI (папки test / output)",
+                "  AutoAction\\AutoAction-GUI.exe — АвтоЭкшен (дроплеты Photoshop)",
+                "  run_autoaction.bat — то же (можно перетащить папку на bat)",
+                "  Меню «Инструменты → АвтоЭкшен» в AutoRAW-GUI",
                 "",
                 "Рядом с exe должны лежать папки reference, rules, droplets.",
+                "Эталоны GUI: reference\\Sneakers\\original\\etalon\\ (1.jpg … 8.jpg).",
                 "CHANGELOG.md — история изменений (меню «Что изменилось»).",
                 "Папку AutoRAWCompressor можно переносить на любой диск.",
                 "",
@@ -210,6 +290,7 @@ def publish(built: Path) -> None:
             raise
     shutil.copytree(built, DIST_DIR)
     copy_assets(DIST_DIR)
+    verify_etalon_assets(DIST_DIR)
     write_launchers(DIST_DIR)
     print(f"\nBuild complete: {DIST_DIR}")
 

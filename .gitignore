@@ -37,3 +37,8 @@ Desktop.ini
 /ui_config.json
 /src/zona/data.dat
 /zona/data.dat
+
+# reference/Sneakers/original/ — dev-файлы не в Git; etalon/ для окна «Эталон» — в Git и в dist
+/reference/Sneakers/original/*
+!/reference/Sneakers/original/etalon/
+!/reference/Sneakers/original/etalon/**

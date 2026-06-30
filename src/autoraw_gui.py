@@ -41,6 +41,20 @@ except Exception:
 from PIL import Image, ImageCms, ImageEnhance, ImageOps, ImageTk
 
 from app_paths import ensure_ui_config, resource_path, ui_config_path
+from outmax_catalog import (
+    DEFAULT_PARSER_URLS,
+    OutmaxCatalog,
+    ProductCatalog,
+    import_local_file,
+    label_export_dir,
+    load_catalog,
+    local_sysbar_text,
+    normalize_parser_urls,
+    parser_sysbar_text,
+    refresh_catalog_async,
+    save_catalog,
+    sysbar_text as outmax_sysbar_text,
+)
 from version import APP_NAME, APP_TITLE, version_string
 from updater import (
     RELEASES_PAGE,
@@ -62,6 +76,7 @@ from autoraw_crop import (
     open_preview,
     target_aspect,
 )
+from ps_window import run_droplet_subprocess, wait_for_output_stable
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".nef", ".dng"}
@@ -73,6 +88,10 @@ ZOOM_MAX = 3.0
 WORKSPACE_ZOOM_MIN = 0.5
 WORKSPACE_ZOOM_MAX = 2.5
 WORKSPACE_ZOOM_STEP = 0.1
+try:
+    _RESAMPLE = Image.Resampling.LANCZOS
+except AttributeError:
+    _RESAMPLE = Image.LANCZOS
 
 # ── Palettes (Light / Dark) ──────────────────────────────────────
 _PALETTES: dict[str, dict[str, str]] = {
@@ -250,10 +269,71 @@ def _save_theme_choice(choice: str) -> None:
     _save_config(cfg)
 
 
+def _load_export_mode_choice() -> str:
+    v = _load_config().get("export_mode", "new")
+    return v if v in ("standard", "new") else "new"
+
+
+def _save_export_mode_choice(choice: str) -> None:
+    cfg = _load_config()
+    cfg["export_mode"] = choice
+    _save_config(cfg)
+
+
+def _load_outmax_label_products() -> bool:
+    return bool(_load_config().get("outmax_label_products", False))
+
+
+def _save_outmax_label_products(enabled: bool) -> None:
+    cfg = _load_config()
+    cfg["outmax_label_products"] = enabled
+    _save_config(cfg)
+
+
+def _load_parser_urls() -> list[str]:
+    urls = _load_config().get("outmax_parser_urls")
+    if isinstance(urls, list):
+        return normalize_parser_urls(urls)
+    return list(DEFAULT_PARSER_URLS)
+
+
+def _save_parser_urls(urls: list[str]) -> None:
+    cfg = _load_config()
+    cfg["outmax_parser_urls"] = normalize_parser_urls(urls)
+    _save_config(cfg)
+
+
+def _load_frame_layouts() -> dict[str, dict[str, float]]:
+    raw = _load_config().get("frame_layout")
+    if not isinstance(raw, dict):
+        return {}
+    layouts: dict[str, dict[str, float]] = {}
+    for frame, values in raw.items():
+        if not isinstance(values, dict):
+            continue
+        try:
+            layouts[str(frame)] = {
+                "offset_x": float(values.get("offset_x", 0.0)),
+                "offset_y": float(values.get("offset_y", 0.0)),
+                "zoom": float(values.get("zoom", 1.0)),
+                "rotation": float(values.get("rotation", 0.0)),
+            }
+        except (TypeError, ValueError):
+            continue
+    return layouts
+
+
+EXPORT_MODE_LABELS = {
+    "standard": "Стандартный",
+    "new": "Новый",
+}
+
+
 # Apply initial palette so module-level constants are set before class creation
 _apply_palette("dark")
 REFERENCE_DIR = resource_path("reference", "Sneakers")
 SEARCH_REFERENCE_DIR = REFERENCE_DIR / "search"
+ETALON_REFERENCE_DIR = REFERENCE_DIR / "original" / "etalon"
 WORKING_MAX_SIDE = 2600
 STANDARD_PROFILE = "Adobe Стандарт"
 STANDARD_EXPOSURE = -7
@@ -265,6 +345,7 @@ STANDARD_SATURATION = 3
 STANDARD_TEMPERATURE = 5017
 STANDARD_TINT = 0
 DROPLETS_DIR = resource_path("droplets")
+RAW_DROPLET_NAME = "RAW.exe"
 DROPLET_BY_FRAME = {
     "01": "01_drop.exe",
     "02": "02-03-04-08_drop.exe",
@@ -275,6 +356,11 @@ DROPLET_BY_FRAME = {
     "06": "05-06-07_drop.exe",
     "07": "05-06-07_drop.exe",
 }
+DROPLET_RUN_ORDER = (
+    "01_drop.exe",
+    "02-03-04-08_drop.exe",
+    "05-06-07_drop.exe",
+)
 
 
 @dataclass
@@ -460,10 +546,134 @@ def crop_box_for_assigned_frame(path: Path, img: Image.Image, aspect: float, fra
     return compute_auto_crop_box(fake_path, img, aspect)
 
 
+def apply_saved_frame_layout(state: FrameState) -> None:
+    layout = _load_frame_layouts().get(state.frame)
+    if not layout:
+        return
+    state.offset_x = layout["offset_x"]
+    state.offset_y = layout["offset_y"]
+    state.zoom = layout["zoom"]
+    state.rotation = layout["rotation"]
+
+
+def persist_frame_layout(state: FrameState) -> None:
+    cfg = _load_config()
+    layouts = cfg.setdefault("frame_layout", {})
+    if not isinstance(layouts, dict):
+        layouts = {}
+        cfg["frame_layout"] = layouts
+    layouts[state.frame] = {
+        "offset_x": state.offset_x,
+        "offset_y": state.offset_y,
+        "zoom": state.zoom,
+        "rotation": state.rotation,
+    }
+    _save_config(cfg)
+
+
+def frame_state_from_assignment(
+    path: Path,
+    img: Image.Image,
+    aspect: float,
+    frame: str,
+    score: float | None,
+) -> FrameState:
+    state = FrameState(
+        path=path,
+        frame=frame,
+        image=img,
+        crop_box=crop_box_for_assigned_frame(path, img, aspect, frame),
+        match_score=score,
+    )
+    apply_saved_frame_layout(state)
+    return state
+
+
 def export_name_for_frame(frame: FrameState) -> str:
     if frame.frame.isdigit():
         return f"{int(frame.frame)}.jpg"
     return f"{frame.path.stem}.jpg"
+
+
+def nef_source_path(frame: FrameState) -> Path | None:
+    path = frame.path
+    if path.suffix.lower() in {".nef", ".dng"}:
+        return path
+    for ext in (".nef", ".NEF", ".dng", ".DNG"):
+        candidate = path.with_suffix(ext)
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _snapshot_pngs(folder: Path) -> dict[Path, tuple[int, int]]:
+    snapshot: dict[Path, tuple[int, int]] = {}
+    for path in folder.glob("*.png"):
+        if not path.is_file():
+            continue
+        stat = path.stat()
+        snapshot[path] = (stat.st_mtime_ns, stat.st_size)
+    return snapshot
+
+
+def _find_droplet_png(
+    before: dict[Path, tuple[int, int]],
+    folder: Path,
+    *,
+    timeout_s: float = 60.0,
+) -> Path | None:
+    """PNG после RAW.exe: новый или перезаписанный (имя может отличаться от NEF)."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        candidates: list[Path] = []
+        for path in folder.glob("*.png"):
+            if not path.is_file():
+                continue
+            stat = path.stat()
+            key = (stat.st_mtime_ns, stat.st_size)
+            prev = before.get(path)
+            if prev is None or prev != key:
+                if stat.st_size > 0:
+                    candidates.append(path)
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            return max(candidates, key=lambda p: p.stat().st_mtime_ns)
+        time.sleep(0.15)
+    return None
+
+
+def scale_crop_box(box: Box, from_size: tuple[int, int], to_size: tuple[int, int]) -> Box:
+    if from_size[0] <= 0 or from_size[1] <= 0:
+        return box
+    sx = to_size[0] / from_size[0]
+    sy = to_size[1] / from_size[1]
+    return Box(
+        int(math.floor(box.left * sx)),
+        int(math.floor(box.top * sy)),
+        int(math.ceil(box.right * sx)),
+        int(math.ceil(box.bottom * sy)),
+    )
+
+
+def _load_export_source_image(path: Path) -> Image.Image:
+    with Image.open(path) as img:
+        img.load()
+        return ImageOps.exif_transpose(img).convert("RGB")
+
+
+def _save_export_jpeg(output: Image.Image, output_path: Path) -> None:
+    save_kwargs = dict(
+        format="JPEG",
+        quality=98,
+        subsampling=0,
+        optimize=False,
+        progressive=True,
+    )
+    icc = _srgb_icc_profile()
+    if icc:
+        save_kwargs["icc_profile"] = icc
+    output.save(output_path, **save_kwargs)
 
 
 def position_frame_number(index: int) -> str:
@@ -472,10 +682,23 @@ def position_frame_number(index: int) -> str:
 
 def apply_frame_numbers_by_order(frames: list[FrameState], aspect: float) -> None:
     """Renumber frames 01..N by list order and refresh crop rules for each slot."""
-    for index, state in enumerate(frames):
+    apply_frame_numbers_at_indices(frames, aspect, range(len(frames)))
+
+
+def apply_frame_numbers_at_indices(
+    frames: list[FrameState],
+    aspect: float,
+    indices: range | list[int] | tuple[int, ...],
+) -> None:
+    """Renumber only the listed slots and refresh their crop rules."""
+    for index in indices:
+        if not (0 <= index < len(frames)):
+            continue
+        state = frames[index]
         frame_num = position_frame_number(index)
         state.frame = frame_num
         state.crop_box = crop_box_for_assigned_frame(state.path, state.image, aspect, frame_num)
+        apply_saved_frame_layout(state)
         state.thumb_cache = None
         state.match_score = None
 
@@ -773,12 +996,19 @@ class AutoRawGui(tk.Tk):
         self.tree_path_by_iid: dict[str, Path] = {}
         self.tree_iid_by_path: dict[Path, str] = {}
         self.drop_window: tk.Toplevel | None = None
+        self._drop_queue: queue.Queue[list] = queue.Queue()
+        self._drop_close_win: tk.Toplevel | None = None
+        self._last_drop_key: tuple[str, ...] = ()
+        self._last_drop_time = 0.0
         self._menu_popups: list[tk.Toplevel] = []
         self.thumb_btns: list[tk.Label] = []
         self.thumb_cards: list[tk.Frame] = []
         self._thumb_drag: dict[str, int | bool] | None = None
         self._thumb_drop_index: int | None = None
-        self.colorcor_drawer_visible = False
+        self._thumb_reorder_busy = False
+        self._thumb_reorder_token = 0
+        self._thumb_swap_from: int | None = None
+        self._colorcor_win: tk.Toplevel | None = None
         self._export_job = JobControl()
         self._export_running = False
         self._export_token = 0
@@ -790,13 +1020,18 @@ class AutoRawGui(tk.Tk):
         self._banner_toast_timer: str | None = None
         self._banner_toast_photo: ImageTk.PhotoImage | None = None
         self._update_check_win: tk.Toplevel | None = None
+        self._outmax_catalog: ProductCatalog | None = load_catalog()
 
         # Theme – must be set before _build_ui() applies palette
         self._theme_choice: str = _load_theme_choice()
+        self._export_mode_choice: str = _load_export_mode_choice()
         dark = self._resolve_dark(self._theme_choice)
         _apply_palette("dark" if dark else "light")
+        self._init_colorcor_vars()
 
         self._etalon_path: str | None = _load_config().get("etalon")
+        self._menubar_frame: tk.Frame | None = None
+        self._toolbar_bar: tk.Frame | None = None
 
         self._build_ui()
         ensure_ui_config()
@@ -804,12 +1039,14 @@ class AutoRawGui(tk.Tk):
         self.bind("<Map>", lambda _e: self._schedule_dark_titlebar(), add="+")
         self.after_idle(self._schedule_dark_titlebar)
         self.after(50, self._enable_drop_target)
+        self.after(50, self._poll_drop_queue)
         self.after(100, self.process_worker_events)
         self.after(500, self._start_sysmon)
+        self.after(800, self._start_outmax_refresh)
         self.after(2000, self._startup_update_check)
 
         if initial_folder:
-            self.load_root(initial_folder)
+            self.add_folders([initial_folder])
 
     def _resolve_dark(self, choice: str) -> bool:
         """Return True (dark mode) for the given theme choice string."""
@@ -836,15 +1073,20 @@ class AutoRawGui(tk.Tk):
         saved_idx      = self.selected_index
         saved_loading  = self.loading_frames
         saved_token    = self.load_token
-        saved_drawer   = getattr(self, "colorcor_drawer_visible", False)
+        colorcor_win   = getattr(self, "_colorcor_win", None)
+        if colorcor_win is not None and colorcor_win.winfo_exists():
+            colorcor_win.destroy()
+        self._colorcor_win = None
 
         # Destroy all widgets and rebuild with updated FIG_* globals
+        self._menubar_frame = None
         for w in self.winfo_children():
             w.destroy()
 
         self._build_ui()
         self._set_window_icon()
         self._schedule_dark_titlebar()
+        self.after(50, self._enable_drop_target)
 
         # Restore state
         self.root_folder    = saved_root
@@ -853,9 +1095,6 @@ class AutoRawGui(tk.Tk):
         self.selected_index  = saved_idx
         self.loading_frames  = saved_loading
         self.load_token      = saved_token
-        self.colorcor_drawer_visible = saved_drawer
-        if saved_drawer:
-            self.after_idle(self._show_colorcor_drawer)
 
         if saved_root:
             self.drop_var.set(str(saved_root))
@@ -872,10 +1111,25 @@ class AutoRawGui(tk.Tk):
                         idx = max(0, min(saved_idx, n - 1)) if n else 0
                         self.select_frame(idx, save_previous=False)
 
+    def _change_export_mode(self, mode: str) -> None:
+        if mode == self._export_mode_choice:
+            return
+        self._export_mode_choice = mode
+        _save_export_mode_choice(mode)
+        if mode == "new" and self.use_colorcor_var.get():
+            self.use_colorcor_var.set(False)
+            self.on_colorcor_toggle()
+        if self._menubar_frame is not None:
+            self._menubar_frame.destroy()
+            self._menubar_frame = None
+        self._build_menubar(before=self._toolbar_bar)
+        label = EXPORT_MODE_LABELS.get(mode, mode)
+        self.set_progress(self.progress_var.get(), f"Режим экспорта: {label}")
+
     def _set_window_icon(self, window: tk.Tk | tk.Toplevel | None = None) -> None:
         """Apply app icon to root or any child dialog."""
         target = window or self
-        icon_path = resource_path("assets", "image", "favicon.ico")
+        icon_path = resource_path("assets", "image", "icon_autoraw_gui.ico")
         if not icon_path.is_file():
             return
         try:
@@ -1644,7 +1898,7 @@ class AutoRawGui(tk.Tk):
         canvas.configure(takefocus=1)
         return canvas
 
-    def _build_menubar(self) -> None:
+    def _build_menubar(self, *, before: tk.Widget | None = None) -> None:
         """Dark custom menubar — native Windows menubar ignores Tk colors."""
         try:
             self.config(menu="")
@@ -1652,7 +1906,11 @@ class AutoRawGui(tk.Tk):
             pass
 
         menubar = tk.Frame(self, bg=FIG_BG, height=25, bd=0, highlightthickness=0)
-        menubar.pack(fill=tk.X)
+        self._menubar_frame = menubar
+        pack_kw: dict[str, object] = dict(fill=tk.X)
+        if before is not None:
+            pack_kw["before"] = before
+        menubar.pack(**pack_kw)  # type: ignore[arg-type]
         menubar.pack_propagate(False)
         inner = tk.Frame(menubar, bg=FIG_BG, bd=0, highlightthickness=0)
         inner.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 0))
@@ -1678,10 +1936,33 @@ class AutoRawGui(tk.Tk):
         self._make_menubar_item(inner, "Вид", view_items)
 
         # ── Настройки ────────────────────────────────────────────────
+        export_mode_items: list[dict[str, object]] = []
+        for _lbl, _mode in (
+            ("Новый", "new"),
+            ("Стандартный", "standard"),
+        ):
+            _is_cur = self._export_mode_choice == _mode
+            export_mode_items.append(
+                dict(
+                    label=("✓  " if _is_cur else "    ") + _lbl,
+                    command=lambda m=_mode: self._change_export_mode(m),
+                )
+            )
         settings_items: list[dict[str, object]] = [
+            dict(label="Режим экспорта", children=export_mode_items),
+            dict(separator=True),
             dict(label="Уведомления от Zona…", command=self.show_zona_settings),
         ]
         self._make_menubar_item(inner, "Настройки", settings_items)
+
+        # ── Инструменты ─────────────────────────────────────────────
+        tools_items: list[dict[str, object]] = [
+            dict(label="Цветокор…", command=self.show_colorcor_window),
+            dict(separator=True),
+            dict(label="АвтоЭкшен…", command=self.launch_autoaction),
+            dict(label="Парсер MAX…", command=self.show_outmax_settings),
+        ]
+        self._make_menubar_item(inner, "Инструменты", tools_items)
 
         # ── О программе ─────────────────────────────────────────────
         about_items: list[dict[str, object]] = [
@@ -1706,6 +1987,7 @@ class AutoRawGui(tk.Tk):
 
         # ── Path / action toolbar ─────────────────────────────────────
         bar = tk.Frame(self, bg=FIG_PANEL, height=44)
+        self._toolbar_bar = bar
         bar.pack(fill=tk.X)
         bar.pack_propagate(False)
         tk.Frame(bar, bg=FIG_BORDER, height=1).pack(side=tk.BOTTOM, fill=tk.X)
@@ -1713,9 +1995,10 @@ class AutoRawGui(tk.Tk):
         bar_inner = tk.Frame(bar, bg=FIG_PANEL)
         bar_inner.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
 
-        self.drop_var = tk.StringVar(value="Вставьте путь или перетащите папку…")
+        self.drop_var = tk.StringVar(value="Перетащите папки для добавления…")
         self.drop_entry = ttk.Entry(bar_inner, textvariable=self.drop_var, font=("Segoe UI", 10))
         self.drop_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self._bind_entry_editing(self.drop_entry)
 
         ttk.Button(bar_inner, text="📂", width=3, command=self.pick_folder).pack(side=tk.LEFT, padx=(0, 4))
 
@@ -1746,6 +2029,15 @@ class AutoRawGui(tk.Tk):
         self._make_check(
             bar_inner, False,
             lambda value: self.use_droplet_var.set(value),
+            bg=FIG_PANEL,
+        ).pack(side=tk.LEFT)
+
+        self.use_autoaction_var = tk.BooleanVar(value=False)
+        tk.Label(bar_inner, text="АвтоЭкшен", bg=FIG_PANEL, fg=FIG_TEXT2,
+                 font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(10, 4))
+        self._make_check(
+            bar_inner, False,
+            self._on_autoaction_toggle,
             bg=FIG_PANEL,
         ).pack(side=tk.LEFT)
 
@@ -1937,20 +2229,12 @@ class AutoRawGui(tk.Tk):
         rb.pack(fill=tk.X, pady=(2, 10))
         ttk.Button(rb, text="Сбросить кадр",  command=self.reset_current).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(rb, text="Сбросить папку", command=self.reset_folder).pack(side=tk.LEFT)
-        self.colorcor_toggle_btn = ttk.Button(
-            rb,
-            text="Цветокор ▸",
-            style="Ghost.TButton",
-            command=self._toggle_colorcor_drawer,
-        )
-        self.colorcor_toggle_btn.pack(side=tk.RIGHT)
-
-        self._init_colorcor_vars()
-        self._build_colorcor_drawer(body)
 
         self.after_idle(self._sync_export_ui)
 
     def _init_colorcor_vars(self) -> None:
+        if hasattr(self, "use_colorcor_var"):
+            return
         self.profile_var = tk.StringVar(value=STANDARD_PROFILE)
         self.exposure_var = tk.IntVar(value=STANDARD_EXPOSURE)
         self.contrast_var = tk.IntVar(value=STANDARD_CONTRAST)
@@ -1960,13 +2244,25 @@ class AutoRawGui(tk.Tk):
         self.saturation_var = tk.IntVar(value=STANDARD_SATURATION)
         self.temperature_var = tk.IntVar(value=STANDARD_TEMPERATURE)
         self.tint_var = tk.IntVar(value=STANDARD_TINT)
-        self.use_colorcor_var = tk.BooleanVar(value=True)
+        self.use_colorcor_var = tk.BooleanVar(value=False)
 
-    def _build_colorcor_drawer(self, body: tk.Frame) -> None:
-        self.colorcor_drawer = tk.Frame(body, bg=FIG_PANEL, width=COLORCOR_PANEL_W)
-        self.colorcor_drawer.pack_propagate(False)
+    def _sync_colorcor_switch(self) -> None:
+        sw = getattr(self, "colorcor_switch", None)
+        if sw is None:
+            return
+        try:
+            if not sw.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        self._draw_modern_switch(
+            sw,
+            bool(self.use_colorcor_var.get()),
+            hover=bool(getattr(sw, "_hover", False)),
+        )
 
-        head = tk.Frame(self.colorcor_drawer, bg=FIG_PANEL)
+    def _build_colorcor_panel(self, parent: tk.Frame) -> None:
+        head = tk.Frame(parent, bg=FIG_PANEL)
         head.pack(fill=tk.X, padx=12, pady=(10, 6))
         pip_row = tk.Frame(head, bg=FIG_PANEL)
         pip_row.pack(side=tk.LEFT)
@@ -1978,18 +2274,11 @@ class AutoRawGui(tk.Tk):
         self.colorcor_switch = self._make_switch(
             head_right, self.use_colorcor_var, self.on_colorcor_toggle, modern=True
         )
-        self.colorcor_switch.pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(
-            head_right,
-            text="✕",
-            style="Ghost.TButton",
-            width=3,
-            command=self._hide_colorcor_drawer,
-        ).pack(side=tk.LEFT)
+        self.colorcor_switch.pack(side=tk.LEFT)
 
-        tk.Frame(self.colorcor_drawer, bg=FIG_BORDER, height=1).pack(fill=tk.X)
+        tk.Frame(parent, bg=FIG_BORDER, height=1).pack(fill=tk.X)
 
-        scroll_wrap = tk.Frame(self.colorcor_drawer, bg=FIG_PANEL)
+        scroll_wrap = tk.Frame(parent, bg=FIG_PANEL)
         scroll_wrap.pack(fill=tk.BOTH, expand=True)
         cc_canvas = tk.Canvas(scroll_wrap, bg=FIG_PANEL, highlightthickness=0, bd=0)
         cc_scroll = self._win11_sb(scroll_wrap, orient=tk.VERTICAL, command=cc_canvas.yview)
@@ -2033,38 +2322,61 @@ class AutoRawGui(tk.Tk):
                 editable=True,
             )
 
-        foot = tk.Frame(self.colorcor_drawer, bg=FIG_PANEL)
+        foot = tk.Frame(parent, bg=FIG_PANEL)
         foot.pack(fill=tk.X, padx=12, pady=(4, 10))
         ttk.Button(foot, text="Сохранить", command=self.save_color_settings).pack(fill=tk.X, pady=(0, 4))
         ttk.Button(foot, text="Сбросить", command=self.reset_color_settings).pack(fill=tk.X, pady=(0, 4))
         ttk.Button(foot, text="Применить к папке", command=self.apply_look_to_folder).pack(fill=tk.X)
 
-    def _sync_colorcor_drawer_btn(self) -> None:
-        if not hasattr(self, "colorcor_toggle_btn"):
+    def show_colorcor_window(self) -> None:
+        if self._colorcor_win is not None and self._colorcor_win.winfo_exists():
+            self._colorcor_win.deiconify()
+            self._colorcor_win.lift()
+            self._colorcor_win.focus_set()
             return
-        self.colorcor_toggle_btn.configure(
-            text="Скрыть ◂" if self.colorcor_drawer_visible else "Цветокор ▸",
-        )
 
-    def _show_colorcor_drawer(self) -> None:
-        if self.colorcor_drawer_visible:
-            return
-        self.colorcor_drawer_visible = True
-        self.colorcor_drawer.pack(side=tk.RIGHT, fill=tk.Y)
-        self._sync_colorcor_drawer_btn()
+        win = tk.Toplevel(self)
+        self._colorcor_win = win
+        win.title("Цветокор")
+        win.geometry(f"{COLORCOR_PANEL_W + 24}x560")
+        win.minsize(COLORCOR_PANEL_W + 24, 420)
+        win.resizable(True, True)
+        win.configure(bg=FIG_BG)
+        win.transient(self)
+        self._prepare_dialog_window(win)
 
-    def _hide_colorcor_drawer(self) -> None:
-        if not self.colorcor_drawer_visible:
-            return
-        self.colorcor_drawer_visible = False
-        self.colorcor_drawer.pack_forget()
-        self._sync_colorcor_drawer_btn()
+        def _close() -> None:
+            self._colorcor_win = None
+            win.destroy()
 
-    def _toggle_colorcor_drawer(self) -> None:
-        if self.colorcor_drawer_visible:
-            self._hide_colorcor_drawer()
-        else:
-            self._show_colorcor_drawer()
+        win.protocol("WM_DELETE_WINDOW", _close)
+
+        panel = tk.Frame(win, bg=FIG_PANEL)
+        panel.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+        if self._export_mode_choice == "new":
+            hint = tk.Frame(panel, bg=FIG_PANEL_L, padx=10, pady=8)
+            hint.pack(fill=tk.X, padx=12, pady=(0, 8))
+            tk.Label(
+                hint,
+                text="В режиме «Новый» экспорт цветокор не применяется — коррекция в RAW-дроплете.",
+                bg=FIG_PANEL_L,
+                fg=FIG_TEXT2,
+                font=("Segoe UI", 8),
+                wraplength=COLORCOR_PANEL_W - 8,
+                justify=tk.LEFT,
+            ).pack(anchor="w")
+
+        self._build_colorcor_panel(panel)
+
+        btn_row = tk.Frame(win, bg=FIG_BG)
+        btn_row.pack(fill=tk.X, padx=12, pady=(0, 12))
+        ttk.Button(btn_row, text="Закрыть", command=_close).pack(side=tk.RIGHT)
+
+    def _on_autoaction_toggle(self, value: bool) -> None:
+        self.use_autoaction_var.set(value)
+        if value:
+            self.use_droplet_var.set(False)
 
     def _on_export_action(self) -> None:
         if self._export_running:
@@ -2573,34 +2885,89 @@ class AutoRawGui(tk.Tk):
         self.thumb_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
 
     def pick_folder(self) -> None:
-        folder = filedialog.askdirectory(title="Выберите корневую папку")
+        folder = filedialog.askdirectory(title="Выберите папку для добавления")
         if folder:
-            self.load_root(Path(folder))
+            self.add_folders([Path(folder)])
 
     def _enable_drop_target(self) -> None:
-        # Safe GUI drag-and-drop (no low-level WinAPI subclassing).
+        # windnd вызывает callback из потока Windows — только очередь, без Tk.
         if windnd is None:
             return
         try:
-            windnd.hook_dropfiles(self, func=self._on_drop_files)
+            windnd.hook_dropfiles(self, func=self._enqueue_drop_files, force_unicode=True)
+            if hasattr(self, "drop_entry"):
+                windnd.hook_dropfiles(self.drop_entry, func=self._enqueue_drop_files, force_unicode=True)
         except Exception:
             pass
 
-    def _on_drop_files(self, files) -> None:
+    @staticmethod
+    def _decode_dropped_files(files) -> list[str]:
         dropped: list[str] = []
         for item in files:
             if isinstance(item, bytes):
                 try:
                     dropped.append(item.decode("utf-8"))
                 except UnicodeDecodeError:
-                    dropped.append(item.decode("mbcs", errors="ignore"))
+                    dropped.append(item.decode("mbcs", errors="replace"))
             else:
                 dropped.append(str(item))
+        return [item.strip().strip('"') for item in dropped if item.strip()]
 
-        folder = self._path_from_input(" ".join(f'"{item}"' for item in dropped if item))
-        if folder is None:
+    def _enqueue_drop_files(self, files) -> None:
+        try:
+            self._drop_queue.put_nowait(list(files))
+        except Exception:
+            pass
+
+    def _poll_drop_queue(self) -> None:
+        try:
+            while True:
+                raw_files = self._drop_queue.get_nowait()
+                dropped = self._decode_dropped_files(raw_files)
+                if not dropped:
+                    continue
+                key = tuple(dropped)
+                now = time.monotonic()
+                if key == self._last_drop_key and now - self._last_drop_time < 0.35:
+                    continue
+                self._last_drop_key = key
+                self._last_drop_time = now
+                self._apply_dropped_files(dropped)
+        except queue.Empty:
+            pass
+        self.after(50, self._poll_drop_queue)
+
+    def _paths_from_dropped(self, dropped: list[str]) -> list[Path]:
+        dirs: list[Path] = []
+        seen: set[Path] = set()
+        for item in dropped:
+            path = Path(item)
+            if path.is_dir():
+                candidate = path.resolve()
+            elif path.is_file():
+                candidate = path.parent.resolve()
+            else:
+                continue
+            if candidate not in seen:
+                seen.add(candidate)
+                dirs.append(candidate)
+        return dirs
+
+    def _apply_dropped_files(self, dropped: list[str]) -> None:
+        paths = self._paths_from_dropped(dropped)
+        if not paths:
+            folder = self._path_from_input(" ".join(f'"{item}"' for item in dropped))
+            if folder is not None:
+                paths = [folder.resolve()]
+        if not paths:
             return
-        self.after_idle(lambda: self.load_root(folder))
+        close_win = self._drop_close_win
+        self._drop_close_win = None
+        if close_win is not None and close_win.winfo_exists():
+            if self.drop_window is close_win:
+                self.drop_window = None
+            close_win.destroy()
+        self.add_folders(paths)
 
     def open_drop_window(self) -> None:
         if self.drop_window and self.drop_window.winfo_exists():
@@ -2623,7 +2990,7 @@ class AutoRawGui(tk.Tk):
         panel.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
         label = tk.Label(
             panel,
-            text="Перетащите сюда папку или файл\n\nПосле дропа окно закроется и путь загрузится в GUI",
+            text="Перетащите одну или несколько папок\n\nОни добавятся в список слева",
             bg=FIG_PANEL,
             fg=FIG_TEXT,
             font=("Segoe UI", 12),
@@ -2648,42 +3015,25 @@ class AutoRawGui(tk.Tk):
             return
 
         def on_drop(files) -> None:
-            dropped: list[str] = []
-            for item in files:
-                if isinstance(item, bytes):
-                    try:
-                        dropped.append(item.decode("utf-8"))
-                    except UnicodeDecodeError:
-                        dropped.append(item.decode("mbcs", errors="ignore"))
-                else:
-                    dropped.append(str(item))
-            folder = self._path_from_input(" ".join(f'"{item}"' for item in dropped if item))
-            if folder is None:
-                return
-
-            def apply_drop() -> None:
-                if win.winfo_exists():
-                    _cleanup()
-                self.load_root(folder)
-
-            self.after_idle(apply_drop)
+            self._drop_close_win = win
+            self._enqueue_drop_files(files)
 
         try:
-            windnd.hook_dropfiles(win, func=on_drop)
-            windnd.hook_dropfiles(panel, func=on_drop)
-            windnd.hook_dropfiles(label, func=on_drop)
+            windnd.hook_dropfiles(win, func=on_drop, force_unicode=True)
+            windnd.hook_dropfiles(panel, func=on_drop, force_unicode=True)
+            windnd.hook_dropfiles(label, func=on_drop, force_unicode=True)
         except Exception:
             label.configure(text="Не удалось включить дроп в этом окне.\nИспользуйте кнопку «Выбрать папку...»")
 
     def _pick_from_drop_window(self, win: tk.Toplevel) -> None:
-        folder = filedialog.askdirectory(title="Выберите корневую папку")
+        folder = filedialog.askdirectory(title="Выберите папку для добавления")
         if not folder:
             return
         if win.winfo_exists():
             win.destroy()
         if self.drop_window is win:
             self.drop_window = None
-        self.load_root(Path(folder))
+        self.add_folders([Path(folder)])
 
     def _path_from_input(self, raw: str) -> Path | None:
         text = raw.strip()
@@ -2722,7 +3072,98 @@ class AutoRawGui(tk.Tk):
         if folder is None:
             messagebox.showerror(APP_NAME, "Укажите путь к папке или файлу.")
             return
-        self.load_root(folder)
+        self.add_folders([folder])
+
+    def _folder_state_keys(self) -> set[Path]:
+        return {path.resolve() for path in self.folder_states}
+
+    def _recompute_root_folder(self) -> None:
+        if not self.folder_states:
+            self.root_folder = None
+            self.drop_var.set("Перетащите папки для добавления…")
+            return
+        paths = [str(path.resolve()) for path in self.folder_states]
+        self.root_folder = Path(os.path.commonpath(paths))
+        count = len(self.folder_states)
+        if count == 1:
+            only = next(iter(self.folder_states))
+            self.drop_var.set(str(only))
+        else:
+            self.drop_var.set(f"{count} папок · {self.root_folder}")
+
+    def add_folders(self, inputs: list[Path]) -> None:
+        normalized: list[Path] = []
+        seen: set[Path] = set()
+        for raw in inputs:
+            path = raw
+            if path.is_file():
+                path = path.parent
+            if not path.is_dir():
+                continue
+            key = path.resolve()
+            if key not in seen:
+                seen.add(key)
+                normalized.append(key)
+        if not normalized:
+            messagebox.showerror(APP_NAME, "Папка не найдена или не выбрана.")
+            return
+
+        self.load_token += 1
+        token = self.load_token
+        self.set_progress(0, "Добавляю папки...")
+        threading.Thread(target=self.add_folders_worker, args=(token, normalized), daemon=True).start()
+
+    def add_folders_worker(self, token: int, inputs: list[Path]) -> None:
+        start_time = time.monotonic()
+        found: list[Path] = []
+        seen: set[Path] = set()
+        try:
+            for index, folder in enumerate(inputs, start=1):
+                self.worker_events.put(
+                    ("progress", token, index - 1, len(inputs), f"Сканирую {folder.name}", 0.0)
+                )
+                for source in discover_source_folders(folder):
+                    key = source.resolve()
+                    if key not in seen:
+                        seen.add(key)
+                        found.append(source)
+            elapsed = time.monotonic() - start_time
+            self.worker_events.put(("add_folders_done", token, found, elapsed))
+        except Exception as exc:
+            self.worker_events.put(("error", token, f"Ошибка добавления папок:\n{exc}"))
+
+    def finish_add_folders(self, token: int, found: list[Path], elapsed: float) -> None:
+        if token != self.load_token:
+            return
+        if not found:
+            self.set_progress(self.progress_var.get(), "Папки с исходниками не найдены")
+            messagebox.showinfo(APP_NAME, "Папки с исходниками не найдены.")
+            return
+
+        existing = self._folder_state_keys()
+        added_paths: list[Path] = []
+        for source_folder in found:
+            key = source_folder.resolve()
+            if key in existing:
+                continue
+            self.folder_states[key] = FolderState(path=source_folder)
+            existing.add(key)
+            added_paths.append(source_folder)
+
+        self._recompute_root_folder()
+        self.render_folder_tree()
+
+        total = len(self.folder_states)
+        if added_paths:
+            info = f"Добавлено: {len(added_paths)}, всего папок: {total} ({elapsed:.1f} сек)"
+            self.set_progress(100, info)
+            if self.selected_folder is None or self.selected_folder.resolve() not in self.folder_states:
+                self.after(0, lambda p=added_paths[0].resolve(): self.select_folder(p))
+            else:
+                self.render_thumbnails()
+        else:
+            self.set_progress(100, f"Все папки уже в списке ({total})")
+            messagebox.showinfo(APP_NAME, "Эти папки уже есть в списке.")
 
     def load_root(self, folder: Path) -> None:
         if folder.is_file():
@@ -2847,8 +3288,10 @@ class AutoRawGui(tk.Tk):
 
     def select_folder(self, folder: Path) -> None:
         self._save_controls_to_current()
-        if folder not in self.folder_states:
+        key = folder.resolve()
+        if key not in self.folder_states:
             return
+        folder = key
         if self.loading_frames:
             self.pending_folder = folder
             self.set_progress(self.progress_var.get(), f"Дождитесь загрузки. Следующая папка: {folder.name}")
@@ -2893,13 +3336,7 @@ class AutoRawGui(tk.Tk):
 
         self.worker_events.put(("progress", token, total, total, "Определяю порядок кадров по search-эталонам", 0.0))
         frames = [
-            FrameState(
-                path=path,
-                frame=frame,
-                image=img,
-                crop_box=crop_box_for_assigned_frame(path, img, aspect, frame),
-                match_score=score,
-            )
+            frame_state_from_assignment(path, img, aspect, frame, score)
             for path, img, frame, score in assign_frames_by_search(loaded)
         ]
 
@@ -2935,13 +3372,7 @@ class AutoRawGui(tk.Tk):
                 messagebox.showwarning(APP_NAME, f"Не удалось открыть {path.name}:\n{exc}")
 
         frames = [
-            FrameState(
-                path=path,
-                frame=frame,
-                image=img,
-                crop_box=crop_box_for_assigned_frame(path, img, aspect, frame),
-                match_score=score,
-            )
+            frame_state_from_assignment(path, img, aspect, frame, score)
             for path, img, frame, score in assign_frames_by_search(loaded)
         ]
         state.frames = frames
@@ -2954,6 +3385,9 @@ class AutoRawGui(tk.Tk):
         self.thumb_cards = []
         self._thumb_drag = None
         self._thumb_drop_index = None
+        self._thumb_swap_from = None
+        if self._thumb_reorder_busy:
+            self._stop_thumb_reorder_progress()
         self.info_var.set(message)
         self.preview.delete("all")
 
@@ -2985,18 +3419,24 @@ class AutoRawGui(tk.Tk):
                 return index
         return None
 
-    def _set_thumb_drop_highlight(self, index: int | None) -> None:
-        if self._thumb_drop_index == index:
+    _THUMB_SWAP_COLOR = "#3ecf8e"
+
+    def _set_thumb_drop_highlight(self, index: int | None, *, from_index: int | None = None) -> None:
+        if self._thumb_drop_index == index and self._thumb_swap_from == from_index:
             return
         if self._thumb_drop_index is not None and 0 <= self._thumb_drop_index < len(self.thumb_cards):
             prev = self.thumb_cards[self._thumb_drop_index]
             if prev.winfo_exists():
                 prev.configure(highlightbackground=FIG_BORDER, highlightthickness=1)
         self._thumb_drop_index = index
+        self._thumb_swap_from = from_index
         if index is not None and 0 <= index < len(self.thumb_cards):
             card = self.thumb_cards[index]
             if card.winfo_exists():
-                card.configure(highlightbackground=FIG_ACCENT, highlightthickness=2)
+                if from_index is not None and index != from_index:
+                    card.configure(highlightbackground=self._THUMB_SWAP_COLOR, highlightthickness=3)
+                else:
+                    card.configure(highlightbackground=FIG_ACCENT, highlightthickness=2)
 
     def _bind_thumb_drag(self, widget: tk.Misc, index: int) -> None:
         widget.bind("<ButtonPress-1>", lambda e, i=index: self._thumb_drag_press(e, i), add="+")
@@ -3004,6 +3444,8 @@ class AutoRawGui(tk.Tk):
         widget.bind("<ButtonRelease-1>", self._thumb_drag_release, add="+")
 
     def _thumb_drag_press(self, event: tk.Event, index: int) -> None:
+        if self._thumb_reorder_busy:
+            return
         self._thumb_drag = {
             "index": index,
             "start_x": event.x_root,
@@ -3022,8 +3464,13 @@ class AutoRawGui(tk.Tk):
                 return
             drag["dragging"] = True
             self.configure(cursor="hand2")
+        from_index = int(drag["index"])
         drop_index = self._thumb_index_at_root(event.x_root, event.y_root)
-        self._set_thumb_drop_highlight(drop_index)
+        self._set_thumb_drop_highlight(drop_index, from_index=from_index)
+        if drop_index is not None and drop_index != from_index:
+            slot_a = position_frame_number(from_index)
+            slot_b = position_frame_number(drop_index)
+            self.progress_label.set(f"↔ Поменять {slot_a} и {slot_b} местами")
 
     def _thumb_drag_release(self, event: tk.Event) -> None:
         drag = self._thumb_drag
@@ -3041,7 +3488,127 @@ class AutoRawGui(tk.Tk):
             return
         self.select_frame(from_index)
 
+    def _flash_thumb_cards(self, indices: list[int], color: str) -> None:
+        for index in indices:
+            if 0 <= index < len(self.thumb_cards):
+                card = self.thumb_cards[index]
+                if card.winfo_exists():
+                    card.configure(highlightbackground=color, highlightthickness=3)
+
+        def _reset() -> None:
+            for index in indices:
+                if 0 <= index < len(self.thumb_cards):
+                    card = self.thumb_cards[index]
+                    if card.winfo_exists():
+                        card.configure(highlightbackground=FIG_BORDER, highlightthickness=1)
+            self._highlight_selected_thumb()
+
+        self.after(450, _reset)
+
+    def _refresh_thumb_card(self, index: int, *, refresh_image: bool = True) -> None:
+        """Update one thumbnail card in-place (badge, filename, optional image)."""
+        frames = self.current_frames()
+        if not frames or not (0 <= index < len(frames)):
+            return
+        if index >= len(self.thumb_cards):
+            return
+        state = frames[index]
+        card = self.thumb_cards[index]
+        if not card.winfo_exists():
+            return
+
+        children = card.winfo_children()
+        if children:
+            badge_row = children[0]
+            badge_children = badge_row.winfo_children()
+            if badge_children:
+                frame_lbl = badge_children[0]
+                if isinstance(frame_lbl, tk.Label):
+                    score_text = ""
+                    if state.match_score is not None:
+                        confidence = max(0, min(99, int(round((1.0 - state.match_score) * 100))))
+                        score_text = f" · {confidence}%"
+                    frame_lbl.configure(
+                        text=f"  {state.frame}{score_text}",
+                        bg=FIG_ACCENT if index == self.selected_index else FIG_BTN,
+                    )
+
+        if refresh_image:
+            self._refresh_single_thumb(index)
+
+        if len(children) >= 3:
+            name_lbl = children[-1]
+            if isinstance(name_lbl, tk.Label):
+                short_name = state.path.name
+                if len(short_name) > 16:
+                    short_name = short_name[:13] + "…"
+                name_lbl.configure(text=short_name)
+
+    def _start_thumb_reorder_progress(self, slot_a: str, slot_b: str) -> None:
+        folder_name = self.selected_folder.name if self.selected_folder else ""
+        suffix = f" ({folder_name})" if folder_name else ""
+        self._thumb_reorder_busy = True
+        self.progress_bar.configure(mode="indeterminate")
+        self.progress_bar.start(12)
+        self.set_progress(0, f"Меняем местами {slot_a} ↔ {slot_b}{suffix}…")
+
+    def _stop_thumb_reorder_progress(self) -> None:
+        self._thumb_reorder_busy = False
+        self.progress_bar.stop()
+        self.progress_bar.configure(mode="determinate")
+
+    def _swap_frames_worker(
+        self,
+        token: int,
+        folder: Path | None,
+        from_index: int,
+        to_index: int,
+    ) -> None:
+        try:
+            if folder is None or folder not in self.folder_states:
+                self.worker_events.put(("swap_done", token, folder, from_index, to_index, False))
+                return
+            frames = self.folder_states[folder].frames
+            if not frames:
+                self.worker_events.put(("swap_done", token, folder, from_index, to_index, False))
+                return
+            aspect = target_aspect(REFERENCE_DIR)
+            apply_frame_numbers_at_indices(frames, aspect, (from_index, to_index))
+            self.worker_events.put(("swap_done", token, folder, from_index, to_index, True))
+        except Exception as exc:
+            self.worker_events.put(("swap_error", token, str(exc)))
+
+    def _finish_swap_frames(
+        self,
+        token: int,
+        folder: Path | None,
+        from_index: int,
+        to_index: int,
+        *,
+        ok: bool,
+    ) -> None:
+        if token != self._thumb_reorder_token:
+            return
+        self._stop_thumb_reorder_progress()
+        slot_a = position_frame_number(from_index)
+        slot_b = position_frame_number(to_index)
+        folder_name = folder.name if folder else ""
+        suffix = f" ({folder_name})" if folder_name else ""
+
+        if not ok:
+            self.set_progress(self.progress_var.get(), f"Не удалось поменять {slot_a} ↔ {slot_b}{suffix}")
+            return
+
+        if folder == self.selected_folder:
+            self._refresh_thumb_card(from_index, refresh_image=True)
+            self._refresh_thumb_card(to_index, refresh_image=True)
+            self.select_frame(self.selected_index, save_previous=False)
+            self._flash_thumb_cards([from_index, to_index], self._THUMB_SWAP_COLOR)
+
+        self.set_progress(100, f"Поменяли местами {slot_a} ↔ {slot_b}{suffix}")
+
     def _reorder_frames(self, from_index: int, to_index: int) -> None:
+        """Swap two frame slots (not insert/shift)."""
         frames = self.current_frames()
         if not frames or not (0 <= from_index < len(frames)):
             return
@@ -3049,38 +3616,39 @@ class AutoRawGui(tk.Tk):
         if from_index == to_index:
             self.select_frame(from_index)
             return
+        if self._thumb_reorder_busy:
+            return
 
         self._save_controls_to_current()
-        was_selected = self.selected_index == from_index
-        selected_state = frames[from_index] if was_selected else None
+        slot_a = position_frame_number(from_index)
+        slot_b = position_frame_number(to_index)
 
-        item = frames.pop(from_index)
-        frames.insert(to_index, item)
+        frames[from_index], frames[to_index] = frames[to_index], frames[from_index]
+        frames[from_index].frame = slot_a
+        frames[to_index].frame = slot_b
 
         if self.selected_folder:
             self.folder_states[self.selected_folder].frames = frames
 
-        aspect = target_aspect(REFERENCE_DIR)
-        apply_frame_numbers_by_order(frames, aspect)
+        if self.selected_index == from_index:
+            self.selected_index = to_index
+        elif self.selected_index == to_index:
+            self.selected_index = from_index
 
-        if was_selected and selected_state is not None:
-            new_index = frames.index(selected_state)
-        elif from_index < self.selected_index <= to_index:
-            new_index = self.selected_index - 1
-        elif to_index <= self.selected_index < from_index:
-            new_index = self.selected_index + 1
-        else:
-            new_index = self.selected_index
-        new_index = max(0, min(new_index, len(frames) - 1))
+        self._refresh_thumb_card(from_index, refresh_image=True)
+        self._refresh_thumb_card(to_index, refresh_image=True)
+        self._highlight_selected_thumb()
+        self._flash_thumb_cards([from_index, to_index], self._THUMB_SWAP_COLOR)
 
-        self.selected_index = new_index
-        self.render_thumbnails()
-        self.select_frame(new_index, save_previous=False)
-        folder_name = self.selected_folder.name if self.selected_folder else ""
-        self.set_progress(
-            self.progress_var.get(),
-            f"Порядок кадров обновлён ({folder_name}): {len(frames)} шт.",
-        )
+        self._thumb_reorder_token += 1
+        token = self._thumb_reorder_token
+        folder = self.selected_folder
+        self._start_thumb_reorder_progress(slot_a, slot_b)
+        threading.Thread(
+            target=self._swap_frames_worker,
+            args=(token, folder, from_index, to_index),
+            daemon=True,
+        ).start()
 
     def _refresh_single_thumb(self, index: int) -> None:
         """Re-render one thumbnail in-place without rebuilding the whole panel."""
@@ -3236,6 +3804,7 @@ class AutoRawGui(tk.Tk):
         state.zoom = self.zoom.get() or 1.0
         state.rotation = self.rotation.get()
         self._read_colorcor_vars(state)
+        persist_frame_layout(state)
 
     def select_frame(self, index: int, *, save_previous: bool = True) -> None:
         prev_index = self.selected_index
@@ -3313,12 +3882,7 @@ class AutoRawGui(tk.Tk):
         self.draw_guides(state.frame)
 
     def on_colorcor_toggle(self) -> None:
-        if hasattr(self, "colorcor_switch"):
-            self._draw_modern_switch(
-                self.colorcor_switch,
-                bool(self.use_colorcor_var.get()),
-                hover=bool(getattr(self.colorcor_switch, "_hover", False)),
-            )
+        self._sync_colorcor_switch()
         for folder_state in self.folder_states.values():
             if not folder_state.frames:
                 continue
@@ -3414,68 +3978,50 @@ class AutoRawGui(tk.Tk):
         {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp"}
     )
 
-    def _auto_load_etalon(self) -> None:
-        """Auto-select the matching reference image for the current frame.
+    def _etalon_path_for_frame(self, frame: str) -> Path | None:
+        """Pick reference/Sneakers/original/etalon/N.jpg for frame number."""
+        etalon_dir = ETALON_REFERENCE_DIR
+        if not etalon_dir.is_dir() or not frame.isdigit():
+            return None
 
-        Looks for:  <root_folder>/reference/<selected_folder_name>/<images sorted>
-        and picks the image matching the assigned frame number (1.jpg..8.jpg).
-        Falls back to the manually saved etalon path if no reference folder is found.
-        """
-        if not self.root_folder or not self.selected_folder:
-            self._display_etalon(self._etalon_path)
-            return
+        n = int(frame)
+        stems = {str(n), f"{n:02d}"}
+        matches: list[Path] = []
+        for path in etalon_dir.iterdir():
+            if not path.is_file() or path.suffix.lower() not in self._IMG_EXTS:
+                continue
+            stem = path.stem
+            if stem in stems or (stem.isdigit() and int(stem) == n):
+                matches.append(path)
+
+        if not matches:
+            return None
+        return sorted(matches, key=lambda p: (len(p.stem), p.name.lower()))[0]
+
+    def _auto_load_etalon(self) -> None:
+        """Show the numbered sample for the current frame from reference/Sneakers/original/etalon/."""
         state = self.current()
         if state is None:
-            self._display_etalon(self._etalon_path)
+            self._display_etalon(None)
             return
 
-        # Candidate locations for the reference root folder
-        ref_root: Path | None = None
-        for candidate in (
-            self.root_folder / "reference",
-            self.root_folder.parent / "reference",
-        ):
-            if candidate.is_dir():
-                ref_root = candidate
-                break
-
-        if ref_root is None:
-            self._display_etalon(self._etalon_path)
+        path = self._etalon_path_for_frame(state.frame)
+        if path is not None:
+            self._display_etalon(str(path))
             return
 
-        # Find subfolder matching selected_folder name (case-insensitive)
-        target_name = self.selected_folder.name.lower()
-        ref_subdir: Path | None = None
-        for d in ref_root.iterdir():
-            if d.is_dir() and d.name.lower() == target_name:
-                ref_subdir = d
-                break
-
-        if ref_subdir is None:
-            self._display_etalon(self._etalon_path)
-            return
-
-        candidates: list[Path] = []
-        if state.frame.isdigit():
-            n = int(state.frame)
-            for stem in (str(n), f"{n:02d}"):
-                candidates.extend(ref_subdir / f"{stem}{ext}" for ext in self._IMG_EXTS)
-
-        for candidate in candidates:
-            if candidate.is_file():
-                self._display_etalon(str(candidate))
+        etalon_dir = ETALON_REFERENCE_DIR
+        if etalon_dir.is_dir():
+            images = sorted(
+                f for f in etalon_dir.iterdir()
+                if f.is_file() and f.suffix.lower() in self._IMG_EXTS
+            )
+            if images:
+                idx = min(self.selected_index, len(images) - 1)
+                self._display_etalon(str(images[idx]))
                 return
 
-        # Fallback for old reference packs where only sorted files exist.
-        images = sorted(
-            f for f in ref_subdir.iterdir()
-            if f.is_file() and f.suffix.lower() in self._IMG_EXTS
-        )
-        if images:
-            idx = min(self.selected_index, len(images) - 1)
-            self._display_etalon(str(images[idx]))
-        else:
-            self._display_etalon(self._etalon_path)
+        self._display_etalon(None, hint=str(etalon_dir))
 
     # ══════════════════════════════════════════════════════════════
     #  System status bar
@@ -3626,6 +4172,33 @@ class AutoRawGui(tk.Tk):
             bg=FIG_PANEL, fg=FIG_TEXT2, font=("Segoe UI", 8, "bold"), width=5,
         )
         self._sysbar_ram_lbl.pack(side=tk.LEFT)
+
+        _sep()
+
+        # ── Outmax catalog ───────────────────────────────────────────
+        self._sysbar_outmax_var = tk.StringVar(value=outmax_sysbar_text(self._outmax_catalog))
+        self._sysbar_outmax_lbl = tk.Label(
+            parent,
+            textvariable=self._sysbar_outmax_var,
+            bg=FIG_PANEL,
+            fg=FIG_TEXT2,
+            font=("Segoe UI", 8),
+            cursor="hand2",
+        )
+        self._sysbar_outmax_lbl.pack(side=tk.LEFT, padx=(6, 2))
+        self._sysbar_outmax_lbl.bind("<Button-1>", lambda _e: self.show_outmax_settings())
+
+    def _update_outmax_sysbar(self) -> None:
+        if hasattr(self, "_sysbar_outmax_var"):
+            self._sysbar_outmax_var.set(outmax_sysbar_text(self._outmax_catalog))
+
+    def _start_outmax_refresh(self) -> None:
+        def _done(catalog: ProductCatalog | None, _error: Exception | None) -> None:
+            if catalog is not None:
+                self._outmax_catalog = catalog
+            self.after(0, self._update_outmax_sysbar)
+
+        refresh_catalog_async(_done, urls=_load_parser_urls())
 
     def _stop_update_badge_pulse(self) -> None:
         if self._update_badge_timer:
@@ -3921,7 +4494,7 @@ class AutoRawGui(tk.Tk):
         _save_config(cfg)
         self._display_etalon(path)
 
-    def _display_etalon(self, path: str | None) -> None:
+    def _display_etalon(self, path: str | None, *, hint: str | None = None) -> None:
         """Render the etalon image (or placeholder) in ref_canvas."""
         if not hasattr(self, "ref_canvas"):
             return
@@ -3932,21 +4505,23 @@ class AutoRawGui(tk.Tk):
                 text="Эталон не загружен", fill=FIG_TEXT2,
                 font=("Segoe UI", 10),
             )
+            sub = hint or "Нажмите для выбора"
             self.ref_canvas.create_text(
                 self._ref_w // 2, self._ref_h // 2 + 10,
-                text="Нажмите для выбора", fill=FIG_TEXT2,
+                text=sub, fill=FIG_TEXT2,
                 font=("Segoe UI", 8),
+                width=self._ref_w - 16,
             )
             return
         try:
             img = ImageOps.exif_transpose(Image.open(path))
-            img = ImageOps.fit(img, (self._ref_w, self._ref_h), Image.LANCZOS)
+            img = ImageOps.fit(img, (self._ref_w, self._ref_h), _RESAMPLE)
             self._ref_photo = ImageTk.PhotoImage(img)
             self.ref_canvas.create_image(0, 0, image=self._ref_photo, anchor=tk.NW)
             # Small "×" button to clear etalon
             self.ref_canvas.create_rectangle(
                 self._ref_w - 20, 0, self._ref_w, 20,
-                fill="#00000088", outline="",
+                fill="#404040", outline="",
             )
             self.ref_canvas.create_text(
                 self._ref_w - 10, 10,
@@ -3954,15 +4529,15 @@ class AutoRawGui(tk.Tk):
                 tags="clear_btn",
             )
             self.ref_canvas.tag_bind("clear_btn", "<Button-1>", lambda _e: self._clear_etalon())
-        except Exception:
-            self._display_etalon(None)
+        except Exception as exc:
+            self._display_etalon(None, hint=f"Ошибка: {exc}")
 
     def _clear_etalon(self) -> None:
         self._etalon_path = None
         cfg = _load_config()
         cfg.pop("etalon", None)
         _save_config(cfg)
-        self._display_etalon(None)
+        self._auto_load_etalon()
 
     # ══════════════════════════════════════════════════════════════
     #  Zona (Telegram) notifications
@@ -4052,6 +4627,7 @@ class AutoRawGui(tk.Tk):
         e_chat = ttk.Entry(win, font=("Segoe UI", 10), width=42)
         e_chat.grid(row=2, column=0, columnspan=2, sticky="ew", **pad)
         e_chat.insert(0, current_chat)
+        self._bind_entry_editing(e_chat)
 
         # ── Enable checkbox ────────────────────────────────────────
         enabled_var = tk.BooleanVar(value=bool(cfg.get("zona_enabled", False)))
@@ -4132,6 +4708,223 @@ class AutoRawGui(tk.Tk):
         ttk.Button(btn_frame, text="Отмена",    command=win.destroy).pack(side=tk.LEFT)
 
         win.columnconfigure(0, weight=1)
+
+    def show_outmax_settings(self) -> None:
+        """Окно настроек парсера товаров."""
+        cfg = _load_config()
+        catalog = self._outmax_catalog
+        user_name = str(cfg.get("user_name", "Иван")).strip() or "Иван"
+
+        win = tk.Toplevel(self)
+        win.title("Парсер MAX")
+        win.geometry("560x620")
+        win.minsize(520, 560)
+        win.resizable(True, True)
+        win.configure(bg=FIG_BG)
+        win.transient(self)
+        win.grab_set()
+        win.focus_set()
+        self._prepare_dialog_window(win)
+
+        outer = tk.Frame(win, bg=FIG_BG)
+        outer.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(outer, bg=FIG_BG, highlightthickness=0)
+        sb = self._win11_sb(outer, orient=tk.VERTICAL, command=canvas.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        body = tk.Frame(canvas, bg=FIG_BG)
+        body_window = canvas.create_window((0, 0), window=body, anchor="nw")
+        pad = dict(padx=20)
+
+        def _on_body_configure(_event: tk.Event | None = None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfigure(body_window, width=canvas.winfo_width())
+
+        body.bind("<Configure>", _on_body_configure)
+        canvas.bind("<Configure>", _on_body_configure)
+
+        # ── Online parsers ─────────────────────────────────────────
+        online_frame = tk.Frame(body, bg=FIG_PANEL, padx=12, pady=10)
+        online_frame.grid(row=0, column=0, sticky="ew", **pad, pady=(16, 0))
+        tk.Label(
+            online_frame, text="Онлайн-парсеры", bg=FIG_PANEL, fg=FIG_TEXT,
+            font=("Segoe UI", 9, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            online_frame,
+            text="Ссылки на YML/XML/CSV фиды. Парсеры имеют приоритет над локальной базой.",
+            bg=FIG_PANEL, fg=FIG_TEXT2, font=("Segoe UI", 8), wraplength=460, justify=tk.LEFT,
+        ).pack(anchor="w", pady=(4, 8))
+
+        url_rows_frame = tk.Frame(online_frame, bg=FIG_PANEL)
+        url_rows_frame.pack(fill=tk.X)
+        url_entries: list[ttk.Entry] = []
+
+        def _remove_url_row(row_frame: tk.Frame, entry: ttk.Entry) -> None:
+            if len(url_entries) <= 1:
+                entry.delete(0, tk.END)
+                return
+            url_entries.remove(entry)
+            row_frame.destroy()
+
+        def _add_url_row(value: str = "") -> None:
+            row = tk.Frame(url_rows_frame, bg=FIG_PANEL)
+            row.pack(fill=tk.X, pady=(0, 6))
+            entry = ttk.Entry(row, font=("Segoe UI", 9))
+            entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+            self._bind_entry_editing(entry)
+            if value:
+                entry.insert(0, value)
+            url_entries.append(entry)
+            ttk.Button(
+                row, text="−", width=3,
+                command=lambda rf=row, e=entry: _remove_url_row(rf, e),
+            ).pack(side=tk.RIGHT)
+
+        for url in _load_parser_urls():
+            _add_url_row(url)
+        if not url_entries:
+            _add_url_row(DEFAULT_PARSER_URLS[0])
+
+        ttk.Button(
+            online_frame, text="+  Добавить ссылку",
+            command=lambda: _add_url_row(""),
+        ).pack(anchor="w", pady=(4, 0))
+
+        parser_status_var = tk.StringVar(
+            value=parser_sysbar_text(catalog) if catalog else "Парсеры ещё не загружены"
+        )
+        tk.Label(
+            body, textvariable=parser_status_var, bg=FIG_BG, fg=FIG_TEXT2,
+            font=("Segoe UI", 9), wraplength=480, justify=tk.LEFT,
+        ).grid(row=1, column=0, sticky="w", pady=(10, 0), **pad)
+
+        # ── Local database ───────────────────────────────────────────
+        local_frame = tk.Frame(body, bg=FIG_PANEL, padx=12, pady=10)
+        local_frame.grid(row=2, column=0, sticky="ew", **pad, pady=(14, 0))
+        tk.Label(
+            local_frame, text="Локальная база", bg=FIG_PANEL, fg=FIG_TEXT,
+            font=("Segoe UI", 9, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            local_frame,
+            text=(
+                "Загрузите YML, XML, CSV или XLSX с товарами. "
+                "Если артикул уже есть в парсере — запись из локальной базы удаляется."
+            ),
+            bg=FIG_PANEL, fg=FIG_TEXT2, font=("Segoe UI", 8), wraplength=460, justify=tk.LEFT,
+        ).pack(anchor="w", pady=(4, 8))
+
+        local_status_var = tk.StringVar(value=local_sysbar_text(catalog))
+        tk.Label(
+            local_frame, textvariable=local_status_var, bg=FIG_PANEL, fg=FIG_TEXT,
+            font=("Segoe UI", 9), wraplength=460, justify=tk.LEFT,
+        ).pack(anchor="w", pady=(0, 8))
+
+        action_var = tk.StringVar(value="")
+
+        def _collect_urls() -> list[str]:
+            return normalize_parser_urls([e.get().strip() for e in url_entries])
+
+        def _apply_catalog(cat: ProductCatalog | None, error: Exception | None) -> None:
+            if cat is not None:
+                self._outmax_catalog = cat
+                parser_status_var.set(parser_sysbar_text(cat))
+                local_status_var.set(local_sysbar_text(cat))
+                action_var.set(f"✅  Парсеры: {cat.parser_count} поз.")
+                self._update_outmax_sysbar()
+            elif error is not None:
+                action_var.set(f"❌  {error}")
+
+        def _refresh() -> None:
+            urls = _collect_urls()
+            if not urls:
+                action_var.set("⚠  Добавьте хотя бы одну ссылку")
+                return
+            action_var.set("Загружаю парсеры…")
+            win.update_idletasks()
+
+            def _done(cat: ProductCatalog | None, error: Exception | None) -> None:
+                self.after(0, lambda: _apply_catalog(cat, error))
+
+            refresh_catalog_async(_done, urls=urls)
+
+        def _import_local() -> None:
+            path = filedialog.askopenfilename(
+                parent=win,
+                title="Загрузить товарную базу",
+                filetypes=[
+                    ("Каталоги", "*.yml *.xml *.csv *.tsv *.xlsx"),
+                    ("YML/XML", "*.yml *.xml"),
+                    ("Таблицы", "*.csv *.tsv *.xlsx"),
+                    ("Все файлы", "*.*"),
+                ],
+            )
+            if not path:
+                return
+            try:
+                updated = import_local_file(
+                    Path(path),
+                    catalog=self._outmax_catalog,
+                    updated_by=user_name,
+                )
+                self._outmax_catalog = updated
+                save_catalog(updated)
+                local_status_var.set(local_sysbar_text(updated))
+                parser_status_var.set(parser_sysbar_text(updated))
+                self._update_outmax_sysbar()
+                action_var.set(
+                    f"✅  Файл загружен: {updated.local_count} поз. в локальной базе"
+                )
+            except Exception as exc:
+                action_var.set(f"❌  {exc}")
+
+        ttk.Button(local_frame, text="📂  Загрузить файл…", command=_import_local).pack(anchor="w")
+
+        # ── Label option ─────────────────────────────────────────────
+        label_var = tk.BooleanVar(value=bool(cfg.get("outmax_label_products", False)))
+        chk_frame = tk.Frame(body, bg=FIG_BG)
+        chk_frame.grid(row=3, column=0, sticky="w", pady=(14, 0), **pad)
+        self._make_check(
+            chk_frame,
+            bool(cfg.get("outmax_label_products", False)),
+            lambda v: label_var.set(v),
+            bg=FIG_BG,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Label(
+            chk_frame, text="Подписать товар", bg=FIG_BG, fg=FIG_TEXT,
+            font=("Segoe UI", 10),
+        ).pack(side=tk.LEFT)
+        tk.Label(
+            body,
+            text="Пример: «41120» → «41120 - NIKE Air Jordan 1». Сначала ищет в парсерах, затем в локальной базе.",
+            bg=FIG_BG, fg=FIG_TEXT2, font=("Segoe UI", 8), wraplength=480, justify=tk.LEFT,
+        ).grid(row=4, column=0, sticky="w", pady=(6, 0), **pad)
+
+        tk.Label(
+            body, textvariable=action_var, bg=FIG_BG, fg=FIG_TEXT2,
+            font=("Segoe UI", 9), wraplength=480, justify=tk.LEFT,
+        ).grid(row=5, column=0, sticky="w", pady=(8, 0), **pad)
+
+        ttk.Button(body, text="🔄  Обновить парсеры", command=_refresh).grid(
+            row=6, column=0, sticky="ew", pady=(12, 0), **pad
+        )
+
+        def _save() -> None:
+            _save_parser_urls(_collect_urls())
+            _save_outmax_label_products(label_var.get())
+            win.destroy()
+
+        btn_frame = tk.Frame(body, bg=FIG_BG)
+        btn_frame.grid(row=7, column=0, pady=(12, 16), sticky="e", **pad)
+        ttk.Button(btn_frame, text="Сохранить", style="Accent.TButton",
+                   command=_save).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_frame, text="Отмена", command=win.destroy).pack(side=tk.LEFT)
+
+        body.columnconfigure(0, weight=1)
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(0, weight=1)
+        _on_body_configure()
 
     # ══════════════════════════════════════════════════════════════
     #  About-menu dialogs
@@ -4229,6 +5022,54 @@ class AutoRawGui(tk.Tk):
         if pos < len(text):
             t.insert(tk.END, text[pos:], base_tag)
 
+    # ── AutoAction ─────────────────────────────────────────────────
+
+    def launch_autoaction(self, queue_dirs: list[Path] | None = None) -> bool:
+        aa_dir = resource_path("AutoAction")
+        exe = aa_dir / "AutoAction-GUI.exe"
+        script = aa_dir / "autoaction_gui.py"
+        bat = aa_dir / "run.bat"
+
+        folder_args: list[str] = []
+        if queue_dirs:
+            folder_args = [str(path.resolve()) for path in queue_dirs if path.is_dir()]
+        elif self.root_folder and self.root_folder.is_dir():
+            folder_args = [str(self.root_folder.resolve())]
+
+        try:
+            if exe.is_file():
+                self._launch_detached([str(exe), *folder_args], cwd=aa_dir)
+                return True
+            if script.is_file() and not getattr(sys, "frozen", False):
+                self._launch_detached([sys.executable, str(script), *folder_args], cwd=aa_dir)
+                return True
+            if bat.is_file():
+                self._launch_detached(["cmd.exe", "/c", str(bat), *folder_args], cwd=aa_dir)
+                return True
+            messagebox.showerror(
+                APP_NAME,
+                f"АвтоЭкшен не найден.\n\nОжидается папка:\n{aa_dir}",
+                parent=self,
+            )
+            return False
+        except OSError as exc:
+            messagebox.showerror(
+                APP_NAME,
+                f"Не удалось запустить АвтоЭкшен:\n{exc}",
+                parent=self,
+            )
+            return False
+
+    def _launch_detached(self, args: list[str], *, cwd: Path) -> None:
+        if sys.platform == "win32":
+            flags = (
+                getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            )
+            subprocess.Popen(args, cwd=str(cwd), close_fds=True, creationflags=flags)
+        else:
+            subprocess.Popen(args, cwd=str(cwd), close_fds=True, start_new_session=True)
+
     # ── About ──────────────────────────────────────────────────────
 
     def show_about(self) -> None:
@@ -4252,7 +5093,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
 - Предпросмотр кадра в реальном времени
 - Настройка позиции (X/Y), масштаба и поворота
 - Автодетекция товара на снимке
-- Цветокоррекция: боковая панель (экспозиция, контраст, тени, света, чёрные, насыщенность, температура, оттенок)
+- Цветокоррекция: Инструменты → Цветокор… (экспозиция, контраст, тени, света, чёрные, насыщенность, температура, оттенок)
 - Эталонный референс для сравнения с образцом
 - Пакетный экспорт выбранных кадров
 - Тёмная / светлая / системная тема
@@ -4327,18 +5168,27 @@ AutoRAW Compressor — инструмент пакетной обработки 
 
 ## 5. Цветокоррекция
 
-Нажмите **Цветокор ▸** под слайдерами X/Y — откроется боковая панель (как в Photoshop).
-Включите переключатель в заголовке панели, настройте параметры (каждый слайдер на отдельной строке с полем значения):
-- **Экспозиция**, **контраст**, **тени**, **света**, **чёрные**, **насыщенность**, **температура**, **оттенок**
+**Инструменты → Цветокор…** — отдельное окно с настройками (экспозиция, контраст, тени, света, чёрные, насыщенность, температура, оттенок).
+По умолчанию цветокор выключен — включите переключатель в заголовке окна.
 
 `Сохранить` — применить настройки к текущему кадру.
 `Применить к папке` — скопировать настройки на все кадры папки.
-`✕` или **Скрыть ◂** — свернуть панель.
 
 ## 6. Экспорт
 
 Нажмите `Экспорт` в верхней панели.
 Экспортируются только кадры с активной галочкой.
+
+**Настройки → Режим экспорта:**
+
+- **Новый** (рекомендуется) — для каждого NEF запускается дроплет `droplets/RAW.exe`
+  (Photoshop + Camera Raw), сохраняется PNG полного разрешения в папке съёмки,
+  затем AutoRAW кадрирует по полному кадру. Цветокор из GUI в этом режиме не применяется
+  (коррекция уже в RAW-дроплете). Прогресс: фазы «RAW» и «Кадрирование».
+- **Стандартный** — экспорт из встроенного превью NEF (~2600 px по длинной стороне);
+  цветокор из окна «Цветокор» применяется, если включён.
+
+После экспорта при необходимости можно включить **Дроплет** или **АвтоЭкшен** в верхней панели.
 """)
         ttk.Button(win, text="Закрыть", command=win.destroy).pack(pady=10)
 
@@ -4721,6 +5571,85 @@ AutoRAW Compressor — инструмент пакетной обработки 
             widget = widget.master
         return False
 
+    def _bind_entry_editing(self, entry: tk.Widget) -> None:
+        """Ctrl+C/V/A/X и контекстное меню; keycode — для русской раскладки Windows."""
+        def _has_selection() -> bool:
+            try:
+                return bool(entry.selection_present())
+            except tk.TclError:
+                return False
+
+        def _copy(_event: tk.Event | None = None) -> str:
+            try:
+                if _has_selection():
+                    entry.clipboard_clear()
+                    entry.clipboard_append(entry.selection_get())
+            except tk.TclError:
+                pass
+            return "break"
+
+        def _paste(_event: tk.Event | None = None) -> str:
+            try:
+                text = entry.clipboard_get()
+                if _has_selection():
+                    entry.delete("sel.first", "sel.last")
+                entry.insert(tk.INSERT, text)
+            except tk.TclError:
+                pass
+            return "break"
+
+        def _cut(_event: tk.Event | None = None) -> str:
+            _copy()
+            try:
+                if _has_selection():
+                    entry.delete("sel.first", "sel.last")
+            except tk.TclError:
+                pass
+            return "break"
+
+        def _select_all(_event: tk.Event | None = None) -> str:
+            entry.select_range(0, tk.END)
+            entry.icursor(tk.END)
+            return "break"
+
+        def _on_control_key(event: tk.Event) -> str | None:
+            if event.keycode == 65:
+                return _select_all()
+            if event.keycode == 67:
+                return _copy()
+            if event.keycode == 86:
+                return _paste()
+            if event.keycode == 88:
+                return _cut()
+            return None
+
+        for seq, handler in (
+            ("<Control-KeyPress>", _on_control_key),
+            ("<Control-v>", _paste), ("<Control-V>", _paste),
+            ("<Control-c>", _copy), ("<Control-C>", _copy),
+            ("<Control-x>", _cut), ("<Control-X>", _cut),
+            ("<Control-a>", _select_all), ("<Control-A>", _select_all),
+            ("<Shift-Insert>", _paste), ("<Control-Insert>", _copy),
+        ):
+            entry.bind(seq, handler)
+
+        menu = tk.Menu(entry, tearoff=0, bg=FIG_PANEL, fg=FIG_TEXT, activebackground=FIG_PANEL_L)
+        menu.add_command(label="Вырезать", command=lambda: _cut())
+        menu.add_command(label="Копировать", command=lambda: _copy())
+        menu.add_command(label="Вставить", command=lambda: _paste())
+        menu.add_separator()
+        menu.add_command(label="Выделить всё", command=lambda: _select_all())
+
+        def _popup(event: tk.Event) -> str:
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+            return "break"
+
+        entry.bind("<Button-3>", _popup)
+        entry.bind("<Button-1>", lambda _e: entry.focus_set(), add="+")
+
     def _update_preview_cursor(self) -> None:
         if not hasattr(self, "preview"):
             return
@@ -4840,6 +5769,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
         self.offset_x.set(state.offset_x)
         self.offset_y.set(state.offset_y)
         self._updating_controls = False
+        persist_frame_layout(state)
         self.render_preview()
         return "break"
 
@@ -4852,6 +5782,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
         state.zoom = 1.0
         state.rotation = 0.0
         state.thumb_cache = None
+        persist_frame_layout(state)
         self.select_frame(self.selected_index, save_previous=False)
 
     def reset_folder(self) -> None:
@@ -4861,6 +5792,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
             state.zoom = 1.0
             state.rotation = 0.0
             state.thumb_cache = None
+            persist_frame_layout(state)
         self.select_frame(self.selected_index, save_previous=False)
 
     def export_checked(self) -> None:
@@ -4878,20 +5810,47 @@ AutoRAW Compressor — инструмент пакетной обработки 
         self._export_token = token
         self._export_job.reset()
         self._set_export_controls(True)
-        use_droplets = bool(self.use_droplet_var.get())
-        use_colorcor = bool(self.use_colorcor_var.get())
+        use_autoaction = bool(self.use_autoaction_var.get())
+        use_droplets = bool(self.use_droplet_var.get()) and not use_autoaction
+        export_mode = self._export_mode_choice
+        use_colorcor = bool(self.use_colorcor_var.get()) and export_mode != "new"
+        if self._thumb_reorder_busy:
+            self._stop_thumb_reorder_progress()
+        self.progress_bar.stop()
+        self.progress_bar.configure(mode="determinate")
         self.set_progress(0, "Готовлю экспорт...")
         n_folders = len(checked_folders)
+        mode_label = EXPORT_MODE_LABELS.get(export_mode, export_mode)
         self._send_zona(
             f"🚀 <b>Экспорт запущен</b>\n"
-            f"Папок: {n_folders}"
+            f"Папок: {n_folders}\n"
+            f"Режим: {mode_label}"
         )
-        threading.Thread(target=self.export_worker, args=(token, checked_folders, use_droplets, use_colorcor), daemon=True).start()
+        threading.Thread(
+            target=self.export_worker,
+            args=(token, checked_folders, use_droplets, use_colorcor, use_autoaction, export_mode),
+            daemon=True,
+        ).start()
 
-    def export_worker(self, token: int, checked_folders: list[Path], use_droplets: bool, use_colorcor: bool) -> None:
+    def export_worker(
+        self,
+        token: int,
+        checked_folders: list[Path],
+        use_droplets: bool,
+        use_colorcor: bool,
+        use_autoaction: bool,
+        export_mode: str = "new",
+    ) -> None:
         exported = 0
         droplet_processed = 0
+        exported_dirs: list[Path] = []
+        label_products = _load_outmax_label_products()
+        outmax_catalog_data = load_catalog() if label_products else None
         job = self._export_job
+        new_export = export_mode == "new"
+        raw_droplet = DROPLETS_DIR / RAW_DROPLET_NAME
+        raw_droplet_warned = False
+        intermediate_pngs: list[Path] = []
         total_units = 0
         for folder in checked_folders:
             folder_state = self.folder_states.get(folder)
@@ -4900,17 +5859,26 @@ AutoRAW Compressor — инструмент пакетной обработки 
             if folder_state.frames is None:
                 source_paths = direct_image_files(folder)[:8]
                 total_units += len(source_paths) * 2
-                if use_droplets:
+                if use_droplets and not new_export:
                     total_units += len(source_paths)
             else:
                 checked_frames = [frame for frame in folder_state.frames if frame.checked]
-                total_units += len(checked_frames)
+                if new_export:
+                    nef_count = len(
+                        {
+                            nef
+                            for frame in checked_frames
+                            if (nef := nef_source_path(frame)) is not None
+                        }
+                    )
+                    total_units += nef_count + len(checked_frames)
+                else:
+                    total_units += len(checked_frames)
                 if use_droplets:
                     total_units += len([frame for frame in checked_frames if frame.frame in DROPLET_BY_FRAME])
         total_units = max(1, total_units)
         done_units = 0
         aspect = target_aspect(REFERENCE_DIR)
-        exported_for_droplets: list[tuple[Path, str]] = []
 
         def stop_now() -> bool:
             return job.should_stop(token, self.load_token)
@@ -4920,6 +5888,108 @@ AutoRAW Compressor — инструмент пакетной обработки 
             eta = (active / max(1, done_units) * max(0, total_units - done_units)) if done_units else 0.0
             pause_note = " · пауза" if job.paused else ""
             self.worker_events.put(("progress", token, done_units, total_units, f"{label}{pause_note}", eta))
+
+        def warn(text: str) -> None:
+            self.worker_events.put(("warning", token, text))
+
+        def run_folder_droplets(folder_exports: list[tuple[Path, str]], folder_name: str) -> None:
+            nonlocal droplet_processed, done_units
+            if not use_droplets or not folder_exports:
+                return
+            grouped: dict[str, list[Path]] = {}
+            for output_path, frame in folder_exports:
+                droplet_name = DROPLET_BY_FRAME.get(frame)
+                if not droplet_name:
+                    continue
+                grouped.setdefault(droplet_name, []).append(output_path)
+
+            droplet_names = [name for name in DROPLET_RUN_ORDER if name in grouped]
+            droplet_names.extend(name for name in grouped if name not in DROPLET_RUN_ORDER)
+
+            for droplet_name in droplet_names:
+                paths = grouped[droplet_name]
+                droplet_exe = DROPLETS_DIR / droplet_name
+                if not droplet_exe.exists():
+                    self.worker_events.put(("warning", token, f"Дроплет не найден:\n{droplet_exe}"))
+                    continue
+                for output_path in paths:
+                    if stop_now():
+                        return
+                    report_progress(f"Дроплет {droplet_name}: {folder_name}\\{output_path.name}")
+                    try:
+                        before_stat = output_path.stat()
+                        result = run_droplet_subprocess([str(droplet_exe), str(output_path)])
+                        if result.returncode == -1 and result.stderr == "timeout":
+                            self.worker_events.put(
+                                (
+                                    "warning",
+                                    token,
+                                    f"Таймаут дроплета {droplet_name} для {output_path.name}",
+                                )
+                            )
+                        wait_for_output_stable(output_path, before_stat)
+                        stderr_text = (result.stderr or "").strip()
+                        stdout_text = (result.stdout or "").strip()
+
+                        after_exists = output_path.exists()
+                        after_stat = output_path.stat() if after_exists else None
+                        changed = bool(
+                            after_stat
+                            and (
+                                after_stat.st_mtime_ns != before_stat.st_mtime_ns
+                                or after_stat.st_size != before_stat.st_size
+                            )
+                        )
+
+                        soft_success = (
+                            result.returncode == 1
+                            and after_exists
+                            and after_stat is not None
+                            and after_stat.st_size > 0
+                            and not stderr_text
+                            and (changed or not stdout_text)
+                        )
+
+                        if result.returncode != 0 and not soft_success:
+                            error_text = stderr_text or stdout_text or f"code {result.returncode}"
+                            self.worker_events.put(
+                                (
+                                    "warning",
+                                    token,
+                                    f"Ошибка дроплета {droplet_name} для {output_path.name}:\n{error_text}",
+                                )
+                            )
+                    except Exception as exc:
+                        self.worker_events.put(
+                            ("warning", token, f"Не удалось запустить дроплет {droplet_name}:\n{exc}")
+                        )
+                    droplet_processed += 1
+                    done_units += 1
+
+        def run_raw_droplet(nef_path: Path) -> Path | None:
+            nonlocal raw_droplet_warned
+            if not raw_droplet.is_file():
+                if not raw_droplet_warned:
+                    warn(f"Дроплет RAW не найден:\n{raw_droplet}")
+                    raw_droplet_warned = True
+                return None
+            folder = nef_path.parent
+            before = _snapshot_pngs(folder)
+            try:
+                result = run_droplet_subprocess([str(raw_droplet), str(nef_path)])
+            except Exception as exc:
+                warn(f"Не удалось запустить {RAW_DROPLET_NAME} для {nef_path.name}:\n{exc}")
+                return None
+            stderr_text = (result.stderr or "").strip()
+            if result.returncode != 0 and stderr_text:
+                warn(
+                    f"Дроплет {RAW_DROPLET_NAME} для {nef_path.name}:\n"
+                    f"{stderr_text or result.stdout or f'code {result.returncode}'}"
+                )
+            png_path = _find_droplet_png(before, folder)
+            if png_path is None:
+                warn(f"После {RAW_DROPLET_NAME} не найден PNG для {nef_path.name}")
+            return png_path
 
         for folder in checked_folders:
             if stop_now():
@@ -4941,7 +6011,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
                         img = open_preview(path, max_side=WORKING_MAX_SIDE)
                         loaded.append((path, img))
                     except Exception as exc:
-                        self.worker_events.put(("warning", token, f"Не удалось открыть {path.name}:\n{exc}"))
+                        warn(f"Не удалось открыть {path.name}:\n{exc}")
                     done_units += 1
                 if stop_now():
                     break
@@ -4963,93 +6033,111 @@ AutoRAW Compressor — инструмент пакетной обработки 
 
             output_dir = folder / folder.name
             output_dir.mkdir(parents=True, exist_ok=True)
-            for frame in checked_frames:
-                if stop_now():
-                    break
-                export_name = export_name_for_frame(frame)
-                report_progress(f"Экспорт {folder.name}\\{export_name}")
-                # Экспорт в том же разрешении, что и редактор — иначе crop_box и смещения расходятся.
-                export_image = frame.image
-                export_crop = frame.crop_box
-                output = render_frame(frame, CANVAS_SIZE, source_image=export_image, crop_box=export_crop)
-                if use_colorcor:
-                    output = apply_frame_colorcor(output, frame)
-                output_path = output_dir / export_name
-                save_kwargs = dict(
-                    format="JPEG",
-                    quality=98,
-                    subsampling=0,
-                    optimize=False,
-                    progressive=True,
-                )
-                icc = _srgb_icc_profile()
-                if icc:
-                    save_kwargs["icc_profile"] = icc
-                output.save(output_path, **save_kwargs)
-                exported_for_droplets.append((output_path, frame.frame))
-                exported += 1
-                done_units += 1
+            folder_exported = 0
+            folder_droplet_exports: list[tuple[Path, str]] = []
+
+            acr_outputs: dict[Path, Path] = {}
+            if new_export:
+                nef_frames: dict[Path, list[FrameState]] = {}
+                for frame in checked_frames:
+                    nef_path = nef_source_path(frame)
+                    if nef_path is None:
+                        warn(f"Нет NEF для кадра {frame.path.name}")
+                        continue
+                    nef_frames.setdefault(nef_path, []).append(frame)
+
+                raw_total = len(nef_frames)
+                raw_done = 0
+                for nef_path in sorted(nef_frames, key=lambda p: p.name.lower()):
+                    if stop_now():
+                        break
+                    raw_done += 1
+                    report_progress(f"RAW: {raw_done}/{raw_total} — {folder.name}\\{nef_path.name}")
+                    png_path = run_raw_droplet(nef_path)
+                    done_units += 1
+                    if png_path is not None:
+                        acr_outputs[nef_path] = png_path
+                        intermediate_pngs.append(png_path)
+
+                crop_total = len(checked_frames)
+                crop_done = 0
+                for frame in checked_frames:
+                    if stop_now():
+                        break
+                    crop_done += 1
+                    nef_path = nef_source_path(frame)
+                    png_path = acr_outputs.get(nef_path) if nef_path else None
+                    export_name = export_name_for_frame(frame)
+                    report_progress(f"Кадрирование: {crop_done}/{crop_total} — {export_name}")
+                    if png_path is None or not png_path.is_file():
+                        done_units += 1
+                        continue
+                    try:
+                        full_image = _load_export_source_image(png_path)
+                    except Exception as exc:
+                        warn(f"Не удалось открыть {png_path.name}:\n{exc}")
+                        done_units += 1
+                        continue
+                    scaled_crop = scale_crop_box(
+                        frame.crop_box,
+                        frame.image.size,
+                        full_image.size,
+                    )
+                    output = render_frame(
+                        frame,
+                        CANVAS_SIZE,
+                        source_image=full_image,
+                        crop_box=scaled_crop,
+                    )
+                    output_path = output_dir / export_name
+                    _save_export_jpeg(output, output_path)
+                    folder_droplet_exports.append((output_path, frame.frame))
+                    exported += 1
+                    folder_exported += 1
+                    done_units += 1
+            else:
+                for frame in checked_frames:
+                    if stop_now():
+                        break
+                    export_name = export_name_for_frame(frame)
+                    report_progress(f"Экспорт {folder.name}\\{export_name}")
+                    export_image = frame.image
+                    export_crop = frame.crop_box
+                    output = render_frame(frame, CANVAS_SIZE, source_image=export_image, crop_box=export_crop)
+                    if use_colorcor:
+                        output = apply_frame_colorcor(output, frame)
+                    output_path = output_dir / export_name
+                    _save_export_jpeg(output, output_path)
+                    folder_droplet_exports.append((output_path, frame.frame))
+                    exported += 1
+                    folder_exported += 1
+                    done_units += 1
+
+            if folder_exported:
+                exported_dirs.append(output_dir)
+            if not stop_now() and folder_droplet_exports:
+                run_folder_droplets(folder_droplet_exports, folder.name)
             if stop_now():
                 break
 
-        if not stop_now() and use_droplets and exported_for_droplets:
-            grouped: dict[str, list[Path]] = {}
-            for output_path, frame in exported_for_droplets:
-                droplet_name = DROPLET_BY_FRAME.get(frame)
-                if not droplet_name:
-                    continue
-                grouped.setdefault(droplet_name, []).append(output_path)
+        if not stop_now() and new_export and intermediate_pngs and exported > 0:
+            for png_path in intermediate_pngs:
+                try:
+                    png_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
-            for droplet_name, paths in grouped.items():
-                droplet_exe = DROPLETS_DIR / droplet_name
-                if not droplet_exe.exists():
-                    self.worker_events.put(("warning", token, f"Дроплет не найден:\n{droplet_exe}"))
-                    continue
-                for output_path in paths:
-                    if stop_now():
-                        break
-                    report_progress(f"Дроплет {droplet_name}: {output_path.name}")
-                    try:
-                        before_stat = output_path.stat()
-                        result = subprocess.run(
-                            [str(droplet_exe), str(output_path)],
-                            **_SUBPROC_TEXT,
-                        )
-                        stderr_text = (result.stderr or "").strip()
-                        stdout_text = (result.stdout or "").strip()
-
-                        after_exists = output_path.exists()
-                        after_stat = output_path.stat() if after_exists else None
-                        changed = bool(after_stat and (after_stat.st_mtime_ns != before_stat.st_mtime_ns or after_stat.st_size != before_stat.st_size))
-
-                        # Photoshop droplet can return code 1 even when file is processed.
-                        # Treat that as soft success when there is no explicit error text.
-                        soft_success = (
-                            result.returncode == 1
-                            and after_exists
-                            and after_stat is not None
-                            and after_stat.st_size > 0
-                            and not stderr_text
-                            and (changed or not stdout_text)
-                        )
-
-                        if result.returncode != 0 and not soft_success:
-                            error_text = stderr_text or stdout_text or f"code {result.returncode}"
-                            self.worker_events.put(
-                                ("warning", token, f"Ошибка дроплета {droplet_name} для {output_path.name}:\n{error_text}")
-                            )
-                    except Exception as exc:
-                        self.worker_events.put(
-                            ("warning", token, f"Не удалось запустить дроплет {droplet_name}:\n{exc}")
-                        )
-                    droplet_processed += 1
-                    done_units += 1
-                if stop_now():
-                    break
+        if label_products and outmax_catalog_data and exported_dirs:
+            renamed_dirs: list[Path] = []
+            for export_dir in exported_dirs:
+                renamed_dirs.append(label_export_dir(export_dir, outmax_catalog_data))
+            exported_dirs = renamed_dirs
 
         active_elapsed = job.active_elapsed()
         cancelled = job.cancelled
-        self.worker_events.put(("export_done", token, exported, droplet_processed, active_elapsed, cancelled))
+        self.worker_events.put(
+            ("export_done", token, exported, droplet_processed, active_elapsed, cancelled, use_autoaction, exported_dirs)
+        )
 
     def set_progress(self, value: float, text: str) -> None:
         self.progress_var.set(max(0, min(100, value)))
@@ -5066,9 +6154,20 @@ AutoRAW Compressor — инструмент пакетной обработки 
             if kind == "discover_done":
                 _, token, folder, found, elapsed = event
                 self.finish_discovery(token, folder, found, elapsed)
+            elif kind == "add_folders_done":
+                _, token, found, elapsed = event
+                self.finish_add_folders(token, found, elapsed)
             elif kind == "frames_done":
                 _, token, folder, frames, elapsed = event
                 self.finish_frames(token, folder, frames, elapsed)
+            elif kind == "swap_done":
+                _, token, folder, from_index, to_index, ok = event
+                self._finish_swap_frames(token, folder, from_index, to_index, ok=ok)
+            elif kind == "swap_error":
+                _, token, message = event
+                if token == self._thumb_reorder_token:
+                    self._stop_thumb_reorder_progress()
+                    self.set_progress(self.progress_var.get(), f"Ошибка обмена кадров: {message}")
             elif kind == "progress":
                 _, token, done, total, label, eta = event
                 if token == self.load_token:
@@ -5076,7 +6175,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
                     eta_text = f", осталось ~{eta:.0f} сек" if eta else ""
                     self.set_progress(percent, f"{label} ({done}/{total}{eta_text})")
             elif kind == "export_done":
-                _, token, exported, droplet_processed, active_elapsed, cancelled = event
+                _, token, exported, droplet_processed, active_elapsed, cancelled, use_autoaction, exported_dirs = event
                 if token != getattr(self, "_export_token", token):
                     continue
                 self._set_export_controls(False)
@@ -5097,9 +6196,16 @@ AutoRAW Compressor — инструмент пакетной обработки 
                     messagebox.showinfo(APP_NAME, msg)
                 else:
                     self._show_export_success_toast(exported, active_elapsed, droplet_processed)
+                    if use_autoaction and exported_dirs:
+                        if self.launch_autoaction(exported_dirs):
+                            info += " · АвтоЭкшен"
+                            msg += f"\n\nЗапущен АвтоЭкшен с {len(exported_dirs)} папками в очереди."
+                            self.set_progress(100, info)
                 zona_text = f"{zona_title}\nФайлов: {exported}  |  Рабочее время: {active_elapsed:.1f} сек"
                 if droplet_processed:
                     zona_text += f"\nДроплет: {droplet_processed}"
+                if use_autoaction and exported_dirs and not cancelled:
+                    zona_text += f"\nАвтоЭкшен: {len(exported_dirs)} папок"
                 self._send_zona(zona_text)
             elif kind == "warning":
                 _, token, text = event

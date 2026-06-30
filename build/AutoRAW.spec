@@ -23,7 +23,7 @@ _numpy_datas = [
     if "\\tests\\" not in src and "/tests/" not in src and not src.endswith("tests")
 ]
 
-_icon = ROOT / "assets" / "image" / "favicon.ico"
+_icon = ROOT / "assets" / "image" / "icon_autoraw_gui.ico"
 _app_datas = [(str(_icon), "assets/image")] if _icon.is_file() else []
 
 # numba/llvmlite (~100 MB) не используются приложением — исключаем из дистрибутива.

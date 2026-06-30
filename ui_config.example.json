@@ -1,7 +1,13 @@
 {
   "theme": "system",
+  "export_mode": "new",
   "zona_chat_id": "",
   "zona_enabled": false,
+  "outmax_label_products": false,
+  "outmax_parser_urls": [
+    "https://outmaxshop.com/yml/all_new.yml"
+  ],
   "user_name": "Иван",
-  "gitverse_token": ""
+  "gitverse_token": "",
+  "frame_layout": {}
 }

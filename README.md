@@ -1,16 +1,27 @@
 # AutoRAW Compressor
 
-**Версия: 0.0.1.20.ProtoAlpha**
+**Версия: 0.0.2.00.Alpha**
 
 Прототип массового автокадрирования для съёмки кроссовок: распознаёт товар на светлом фоне, применяет правила посадки по номеру кадра и готовит план кропа для Photoshop. Есть CLI и GUI с ручной подстройкой и экспортом.
 
 Репозиторий: [gitverse.ru/delbraun/AutoRAWCompressor](https://gitverse.ru/delbraun/AutoRAWCompressor)
 
+## Что нового в 0.0.2.00.Alpha
+
+- **Панель «Эталон»** — при выборе кадра автоматически подставляется образец из `reference/Sneakers/original/etalon/` (кадр 1 → `1.jpg`, 2 → `2.jpg` и т.д.); сброс (×) снова загружает образец по номеру.
+- **Иконки** — обновлены `assets/image/favicon.png` (основное приложение) и `assets/image/icon_AutoAction.png` (АвтоЭкшен).
+- **Сборка dist** — в portable-копию попадает `reference/Sneakers/original/etalon/`; при сборке проверяется наличие эталонов.
+- **Codename** — переход с `ProtoAlpha` на `Alpha`.
+
+Подробнее: [CHANGELOG.md](CHANGELOG.md).
+
 ## Возможности
 
 - **Автокадрирование** — детектор товара, правила из `rules/`, нормализованный crop `0..1` для полного RAW в Photoshop.
 - **RAW без полной конвертации** — из NEF/DNG берётся встроенный JPEG, рабочее превью до 1200 px по длинной стороне.
-- **GUI** — дерево папок, 8 превью, ручной сдвиг/масштаб/поворот, цветокор, дроплеты Photoshop, экспорт отмеченных кадров.
+- **GUI** — дерево папок, 8 превью, ручной сдвиг/масштаб/поворот, цветокор, панель **«Эталон»** для сравнения с образцом, дроплеты Photoshop, экспорт отмеченных кадров.
+- **Режим экспорта** — **Новый** (NEF → RAW-дроплет → PNG полного разрешения → кадрирование) и **Стандартный**; настройка в **Настройки → Режим экспорта**.
+- **АвтоЭкшен** (`AutoAction/`) — отдельное приложение для пакетной обработки 1.jpg–8.jpg через Photoshop-дроплеты (версия совпадает с основным продуктом).
 - **CLI** — пакетная обработка в `output/` с debug-превью и `crop_plan.json` / `crop_plan.jsx`.
 - **Portable-сборка** — `dist/AutoRAWCompressor/` с exe и всеми ресурсами.
 
@@ -74,15 +85,17 @@ build.bat run      rem запустить GUI из dist
 | `06` | `rules/6.jpg` | высота 897 px, отступы сверху/снизу 76 px, центр по X |
 | `05`, `07` | `rules/other.png` | только вручную (`manual_only`) |
 
-Референс для сравнения: `reference/Sneakers/`. Профиль цвета: `color/standart.xmp`.
+Референс для сравнения: `reference/Sneakers/`; образцы для панели «Эталон»: `reference/Sneakers/original/etalon/`. Профиль цвета: `color/standart.xmp`.
 
 ## Структура проекта
 
 ```text
 Compressor/
 ├── src/                 # autoraw_gui.py, autoraw_crop.py, app_paths.py
+├── AutoAction/          # АвтоЭкшен — пакетная обработка через дроплеты
 ├── rules/               # эталоны посадки
-├── reference/           # референсные JPG
+├── reference/           # референсные JPG (в т.ч. original/etalon/ для GUI)
+├── assets/image/        # favicon.png, icon_AutoAction.png
 ├── color/               # XMP-профиль
 ├── droplets/            # Photoshop droplet (.exe)
 ├── build/               # PyInstaller, gitverse_setup.ps1
@@ -145,7 +158,7 @@ python build\publish_gitverse_release.py
 
 В приложении: **Справка → Проверить обновление…** — скачивание, прогресс, распаковка в папку exe и перезапуск.
 
-Имя ZIP: `AutoRAWCompressor-0.0.1.20.ProtoAlpha.zip`. Настройки пользователя и `zona/data.dat` при обновлении сохраняются.
+Имя ZIP: `AutoRAWCompressor-0.0.2.00.Alpha.zip`. Настройки пользователя и `zona/data.dat` при обновлении сохраняются.
 
 **Защитник Windows / SmartScreen:** неподписанный PyInstaller-exe и скрипт установки обновления могут вызывать предупреждение. Это ожидаемо: «Подробнее» → «Выполнить в любом случае», либо добавьте папку `AutoRAWCompressor` в исключения Защитника. Цифровая подпись exe планируется отдельно.
 
@@ -181,9 +194,9 @@ Remote: `gitverse` → `https://gitverse.ru/delbraun/AutoRAWCompressor.git`
 | `Y` | `VERSION_SEMI` | Полуглобальные изменения |
 | `Z` | `VERSION_FEATURE` | Нововведения и изменения функций |
 | `W` | `VERSION_PATCH` | Мелкие исправления и мелкие нововведения |
-| Codename | `VERSION_CODENAME` | Название сборки (`ProtoAlpha`, …) |
+| Codename | `VERSION_CODENAME` | Название сборки (`Alpha`, `Beta`, …) |
 
-Строка версии: `X.Y.Z.W.Codename` (сейчас **0.0.1.20.ProtoAlpha**).
+Строка версии: `X.Y.Z.W.Codename` (сейчас **0.0.2.00.Alpha**).
 
 Отображается в заголовке GUI, `--version` CLI, меню `build.bat` и `dist/README.txt` после сборки.
 

@@ -43,10 +43,13 @@ def _merge_config_dict(current: dict, other: dict) -> tuple[dict, bool]:
     for key in (
         "gitverse_token",
         "theme",
+        "export_mode",
         "etalon",
         "user_name",
         "zona_chat_id",
         "zona_enabled",
+        "outmax_label_products",
+        "outmax_parser_urls",
     ):
         if not str(merged.get(key, "")).strip() and str(other.get(key, "")).strip():
             merged[key] = other[key]
@@ -101,10 +104,13 @@ def ensure_ui_config() -> Path:
         path,
         {
             "theme": "system",
+            "export_mode": "new",
             "gitverse_token": "",
             "user_name": "Иван",
             "zona_chat_id": "",
             "zona_enabled": False,
+            "outmax_label_products": False,
+            "outmax_parser_urls": ["https://outmaxshop.com/yml/all_new.yml"],
         },
     )
     return path

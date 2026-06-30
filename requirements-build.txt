@@ -4,3 +4,6 @@ pyinstaller>=6.0
 
 # MSIX: Windows 10/11 SDK (makeappx + signtool) — ставится отдельно:
 # winget install Microsoft.WindowsSDK.10.0.22621
+#
+# MSI: WiX Toolset v3.14 (heat + candle + light) + SignTool из Windows SDK:
+# https://github.com/wixtoolset/wix3/releases

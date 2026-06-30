@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -27,7 +28,7 @@ from installer_common import (  # noqa: E402
 MSIX_WORK = ROOT / "build" / "msix" / "work"
 MSIX_PKG = MSIX_WORK / "package"
 MSIX_ASSETS = MSIX_WORK / "assets"
-ICON_SRC = ROOT / "assets" / "image" / "favicon.ico"
+ICON_SRC = ROOT / "assets" / "image" / "icon_setup.ico"
 
 PACKAGE_NAME = "Delbraun.AutoRAWCompressor"
 PUBLISHER = "CN=Delbraun"
@@ -152,20 +153,26 @@ def ensure_signing_cert() -> None:
         return
 
     CERT_PFX.parent.mkdir(parents=True, exist_ok=True)
+    temp_pfx = Path(tempfile.gettempdir()) / "Delbraun_autoraw_sign.pfx"
     ps = f"""
 $pwd = ConvertTo-SecureString -String '{CERT_PASSWORD}' -Force -AsPlainText
 $cert = New-SelfSignedCertificate -Type Custom -Subject '{PUBLISHER}' `
   -KeyUsage DigitalSignature -FriendlyName 'AutoRAW MSIX' `
   -CertStoreLocation 'Cert:\\CurrentUser\\My' `
+  -HashAlgorithm SHA256 -KeyAlgorithm RSA -KeyLength 2048 `
   -TextExtension @('2.5.29.37={{text}}1.3.6.1.5.5.7.3.3')
-Export-PfxCertificate -Cert $cert -FilePath '{CERT_PFX}' -Password $pwd | Out-Null
-Write-Host 'Created signing certificate:' '{CERT_PFX}'
+Export-PfxCertificate -Cert $cert -FilePath '{temp_pfx}' -Password $pwd | Out-Null
+Write-Host 'Created signing certificate:' '{temp_pfx}'
 """
     print("Creating self-signed MSIX certificate...")
     subprocess.check_call(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
         cwd=ROOT,
     )
+    if not temp_pfx.is_file():
+        raise FileNotFoundError(f"Certificate export failed: {temp_pfx}")
+    shutil.copy2(temp_pfx, CERT_PFX)
+    print(f"Certificate saved: {CERT_PFX}")
 
 
 def run_makeappx(makeappx: Path, output_msix: Path) -> None:

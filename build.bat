@@ -36,11 +36,13 @@ echo   1 - Build dist\AutoRAWCompressor
 
 echo   2 - Build MSIX package
 
-echo   3 - Clean build artifacts
+echo   3 - Build MSI installer
 
-echo   4 - Run GUI from dist
+echo   4 - Clean build artifacts
 
-echo   5 - Help
+echo   5 - Run GUI from dist
+
+echo   6 - Help
 
 echo   0 - Exit
 
@@ -48,7 +50,7 @@ echo.
 
 set "CHOICE="
 
-set /p CHOICE=Select [1-5, 0]: 
+set /p CHOICE=Select [0-6]: 
 
 
 
@@ -58,11 +60,13 @@ if "%CHOICE%"=="1" call :do_build & goto menu
 
 if "%CHOICE%"=="2" call :do_msix & goto menu
 
-if "%CHOICE%"=="3" call :do_clean & goto menu
+if "%CHOICE%"=="3" call :do_msi & goto menu
 
-if "%CHOICE%"=="4" call :do_run & goto menu
+if "%CHOICE%"=="4" call :do_clean & goto menu
 
-if "%CHOICE%"=="5" call :do_help & goto menu
+if "%CHOICE%"=="5" call :do_run & goto menu
+
+if "%CHOICE%"=="6" call :do_help & goto menu
 
 echo Invalid choice.
 
@@ -76,7 +80,7 @@ if /I "%~1"=="build" call :do_build & exit /b %errorlevel%
 
 if /I "%~1"=="msix" call :do_msix & exit /b %errorlevel%
 
-if /I "%~1"=="msi" call :do_msix & exit /b %errorlevel%
+if /I "%~1"=="msi" call :do_msi & exit /b %errorlevel%
 
 if /I "%~1"=="clean" call :do_clean & exit /b %errorlevel%
 
@@ -104,6 +108,8 @@ if errorlevel 1 (
 
     echo Build failed.
 
+    pause
+
     exit /b 1
 
 )
@@ -130,6 +136,8 @@ if errorlevel 1 (
 
     echo Install Windows SDK: winget install Microsoft.WindowsSDK.10.0.22621
 
+    pause
+
     exit /b 1
 
 )
@@ -137,6 +145,36 @@ if errorlevel 1 (
 echo.
 
 echo Done: dist\AutoRAWCompressor-*.msix
+
+echo        dist\AutoRAWCompressor-*-CHANGELOG.txt
+
+exit /b 0
+
+
+
+:do_msi
+
+echo.
+
+echo Building MSI installer...
+
+%PYTHON_EXE% build\build_msi.py --rebuild-dist
+
+if errorlevel 1 (
+
+    echo MSI build failed.
+
+    echo Install WiX Toolset 3.14 and Windows SDK (signtool).
+
+    pause
+
+    exit /b 1
+
+)
+
+echo.
+
+echo Done: dist\AutoRAWCompressor-*.msi
 
 echo        dist\AutoRAWCompressor-*-CHANGELOG.txt
 
@@ -157,6 +195,8 @@ if exist "dist\AutoRAWCompressor-*.msi" del /q "dist\AutoRAWCompressor-*.msi" 2>
 if exist "dist\AutoRAWCompressor-*-CHANGELOG.txt" del /q "dist\AutoRAWCompressor-*-CHANGELOG.txt" 2>nul
 
 if exist "build\msix\work" rmdir /s /q "build\msix\work" 2>nul
+
+if exist "build\msi\work" rmdir /s /q "build\msi\work" 2>nul
 
 echo Clean complete.
 
@@ -186,13 +226,15 @@ exit /b 0
 
 echo.
 
-echo Usage: build.bat [build^|msix^|clean^|run^|help]
+echo Usage: build.bat [build^|msix^|msi^|clean^|run^|help]
 
 echo.
 
 echo   build  - compile portable dist to dist\AutoRAWCompressor
 
 echo   msix   - build MSIX package into dist\
+
+echo   msi    - build MSI installer into dist\
 
 echo   clean  - remove dist and build cache
 
@@ -206,12 +248,17 @@ echo   winget install Microsoft.WindowsSDK.10.0.22621
 
 echo.
 
+echo MSI requires WiX Toolset 3.14 (heat, candle, light) + SignTool:
+
+echo   https://github.com/wixtoolset/wix3/releases
+
+echo.
+
 echo First install on PC: run build\msix\install_cert.bat as Administrator,
 
-echo then double-click the .msix file.
+echo then install the .msix or .msi package.
 
 echo.
 
 exit /b 0
-
 
