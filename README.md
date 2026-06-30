@@ -1,10 +1,14 @@
 # AutoRAW Compressor
 
-**Версия: 0.0.2.00.Alpha**
+**Версия: 0.0.2.10.Alpha**
 
 Прототип массового автокадрирования для съёмки кроссовок: распознаёт товар на светлом фоне, применяет правила посадки по номеру кадра и готовит план кропа для Photoshop. Есть CLI и GUI с ручной подстройкой и экспортом.
 
-Репозиторий: [gitverse.ru/delbraun/AutoRAWCompressor](https://gitverse.ru/delbraun/AutoRAWCompressor)
+Репозиторий: [github.com/divangames/AutpRAW-Compressor](https://github.com/divangames/AutpRAW-Compressor)
+
+## Что нового в 0.0.2.10.Alpha
+
+- **Экспорт** — у каждой папки свой статус-бар: «В очереди», прогресс обработки или зелёное «Готово».
 
 ## Что нового в 0.0.2.00.Alpha
 
@@ -64,7 +68,9 @@ run_autocrop.bat
 | `run_gui.bat` | Графический интерфейс |
 | `run_autocrop.bat` | CLI: автокадрирование в `output/` |
 | `build.bat` | Меню сборки / очистки / запуск dist |
-| `sync_gitverse.bat` | Push в GitVerse |
+| `sync_github.bat` | Push в GitHub (основной remote) |
+| `sync_gitverse.bat` | Push в GitVerse (зеркало кода) |
+| `sync_all.bat` | Push в GitHub и GitVerse |
 
 `build.bat` без аргументов открывает меню. Из командной строки:
 
@@ -98,13 +104,14 @@ Compressor/
 ├── assets/image/        # favicon.png, icon_AutoAction.png
 ├── color/               # XMP-профиль
 ├── droplets/            # Photoshop droplet (.exe)
-├── build/               # PyInstaller, gitverse_setup.ps1
+├── build/               # PyInstaller, publish_github_release.py
 ├── test/                # локальные RAW/JPG (в .gitignore)
 ├── output/              # результаты CLI (в .gitignore)
 ├── setup.bat
 ├── run_gui.bat
 ├── run_autocrop.bat
 ├── build.bat
+├── sync_github.bat
 └── sync_gitverse.bat
 ```
 
@@ -142,19 +149,19 @@ winget install Microsoft.WindowsSDK.10.0.22621
 
 ### Автообновление (portable / exe)
 
-**Пользователям** токен GitVerse не нужен: в официальной сборке read-only доступ к Generic Packages вшит при сборке.
+**Пользователям** токен GitHub не нужен: обновления берутся из [GitHub Releases](https://github.com/divangames/AutpRAW-Compressor/releases).
 
 **Сборка релиза (maintainers):**
 
 ```text
-set GITVERSE_READ_TOKEN=<read-only token, только packages>
 python build\build_dist.py
 python build\build_release_zip.py
-python build\publish_gitverse_release.py
+set GITHUB_TOKEN=<token with repo scope>
+python build\publish_github_release.py
 ```
 
-`GITVERSE_READ_TOKEN` не коммитить; `src/builtin_gitverse_read_token.py` в `.gitignore`.  
-Опционально для разработки из исходников: `gitverse_token` в `%LOCALAPPDATA%\AutoRAWCompressor\ui_config.json` или `GITVERSE_TOKEN`.
+`GITHUB_TOKEN` не коммитить. Опционально для лимита API: `GITHUB_READ_TOKEN` при сборке dist (вшивается в exe).  
+Для приватного репозитория или разработки из исходников: `github_token` в `%LOCALAPPDATA%\AutoRAWCompressor\ui_config.json` или `GITHUB_TOKEN`.
 
 В приложении: **Справка → Проверить обновление…** — скачивание, прогресс, распаковка в папку exe и перезапуск.
 
@@ -168,15 +175,21 @@ python build\publish_gitverse_release.py
 pip install -r requirements-build.txt
 ```
 
-## Git (только GitVerse)
+## Git (GitHub + GitVerse)
 
-Код публикуется на **GitVerse**, не на GitHub.
+Код пушится в **оба** remote — только commit и push, без релизов на GitVerse.
+
+| Remote | Назначение |
+|--------|------------|
+| `github` | [github.com/divangames/AutpRAW-Compressor](https://github.com/divangames/AutpRAW-Compressor) — основной; **релизы и автообновление** |
+| `gitverse` | [gitverse.ru/delbraun/AutoRAWCompressor](https://gitverse.ru/delbraun/AutoRAWCompressor) — зеркало кода |
 
 ```text
+sync_github.bat
 sync_gitverse.bat
 ```
 
-Remote: `gitverse` → `https://gitverse.ru/delbraun/AutoRAWCompressor.git`
+Релиз portable-сборки — только на GitHub (`python build\publish_github_release.py`, см. раздел «Автообновление»).
 
 Папка `test/` с RAW-файлами **не попадает в репозиторий** (см. `.gitignore`). Каждый разработчик держит тестовые снимки локально.
 

@@ -1,6 +1,7 @@
 {
   "theme": "system",
   "export_mode": "new",
+  "load_mode": "fast",
   "zona_chat_id": "",
   "zona_enabled": false,
   "outmax_label_products": false,
@@ -8,6 +9,6 @@
     "https://outmaxshop.com/yml/all_new.yml"
   ],
   "user_name": "Иван",
-  "gitverse_token": "",
+  "github_token": "",
   "frame_layout": {}
 }

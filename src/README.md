@@ -34,25 +34,30 @@ build.bat build
 
 Очистка: `build.bat clean`
 
-## GitVerse (параллельно с локальным git)
+## Git (GitHub + GitVerse)
 
-Remote: `gitverse` → https://gitverse.ru/delbraun/AutoRAWCompressor
+Код пушится в оба remote. **Релизы и автообновление — только GitHub.**
 
-1. Создайте **пустой** репозиторий на [gitverse.ru/new](https://gitverse.ru/new): имя `AutoRAWCompressor`, без README и `.gitignore` (или используйте уже созданный: [delbraun/AutoRAWCompressor](https://gitverse.ru/delbraun/AutoRAWCompressor)).
-2. Отправьте код:
+| Remote | URL |
+|--------|-----|
+| `github` | https://github.com/divangames/AutpRAW-Compressor |
+| `gitverse` | https://gitverse.ru/delbraun/AutoRAWCompressor |
 
 ```text
+sync_github.bat
 sync_gitverse.bat
 ```
 
-Или с API-токеном (Настройки → Управление токенами → Репозитории + Публичное API):
+Первичная настройка GitVerse (пустой репозиторий + remote):
 
 ```powershell
 $env:GITVERSE_TOKEN = "ваш_токен"
 powershell -ExecutionPolicy Bypass -File build\gitverse_setup.ps1
 ```
 
-После коммитов: `git push gitverse master` или снова `sync_gitverse.bat`.
+После коммитов: `git push github master` / `git push gitverse master` или bat-файлы выше.
+
+Публикация релиза: `python build\publish_github_release.py` (см. корневой README).
 
 Точка отката локально: `git checkout savepoint-2026-05-26`.
 

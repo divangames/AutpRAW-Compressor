@@ -23,29 +23,28 @@ AA_SPEC = ROOT / "build" / "AutoAction-GUI.spec"
 ASSET_DIRS = ("reference", "rules", "color", "assets", "droplets")
 # Не копировать в dist — нужны только при сборке MSIX / разработке.
 ASSET_IGNORE_NAMES = {"icon.psd", "setup.png", "installer_banner.png", "icon_setup.ico", "icon_setup.png"}
-BUILTIN_TOKEN_PATH = SRC / "builtin_gitverse_read_token.py"
+BUILTIN_TOKEN_PATH = SRC / "builtin_github_read_token.py"
 
 
-def write_builtin_gitverse_read_token() -> None:
-    """Вшивает read-only токен GitVerse в dist (не коммитить файл с реальным токеном)."""
-    token = os.environ.get("GITVERSE_READ_TOKEN", "").strip()
+def write_builtin_github_read_token() -> None:
+    """Вшивает read-only токен GitHub в dist (не коммитить файл с реальным токеном)."""
+    token = os.environ.get("GITHUB_READ_TOKEN", "").strip()
     BUILTIN_TOKEN_PATH.write_text(
         "\n".join(
             [
-                '"""Read-only токен для автообновления. Перезаписывается при сборке (GITVERSE_READ_TOKEN)."""',
+                '"""Read-only токен для автообновления. Перезаписывается при сборке (GITHUB_READ_TOKEN)."""',
                 "",
-                f"BUILTIN_GITVERSE_READ_TOKEN = {token!r}",
+                f"BUILTIN_GITHUB_READ_TOKEN = {token!r}",
                 "",
             ]
         ),
         encoding="utf-8",
     )
     if token:
-        print("builtin_gitverse_read_token.py: GITVERSE_READ_TOKEN записан (файл в .gitignore).")
+        print("builtin_github_read_token.py: GITHUB_READ_TOKEN записан (файл в .gitignore).")
     else:
         print(
-            "WARNING: GITVERSE_READ_TOKEN не задан — в собранном exe автообновление не скачает ZIP.\n"
-            "  Перед релизом: set GITVERSE_READ_TOKEN=<read-only packages token>"
+            "NOTE: GITHUB_READ_TOKEN не задан — для публичного репозитория автообновление работает без токена."
         )
 
 
@@ -320,7 +319,7 @@ def main() -> int:
             subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
 
     ensure_pyinstaller()
-    write_builtin_gitverse_read_token()
+    write_builtin_github_read_token()
 
     if STAGING.exists():
         shutil.rmtree(STAGING)

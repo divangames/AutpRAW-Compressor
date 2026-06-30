@@ -1,4 +1,4 @@
-"""ZIP portable-сборки для релиза на GitVerse."""
+"""ZIP portable-сборки для релиза на GitHub."""
 from __future__ import annotations
 
 import argparse
@@ -15,7 +15,7 @@ from version import version_string  # noqa: E402
 
 DIST = ROOT / "dist" / "AutoRAWCompressor"
 OUT = ROOT / "dist"
-# CLI onefile (~33 MB) не нужен для автообновления GUI; уменьшает ZIP под лимит GitVerse (~50 MB).
+# CLI onefile (~33 MB) не нужен для автообновления GUI; уменьшает размер ZIP релиза.
 RELEASE_ZIP_SKIP = {"AutoRAW-Crop.exe"}
 
 

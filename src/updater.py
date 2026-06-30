@@ -1,4 +1,4 @@
-"""Проверка и установка обновлений с GitVerse."""
+"""Проверка и установка обновлений с GitHub Releases."""
 from __future__ import annotations
 
 import json
@@ -9,7 +9,6 @@ import ssl
 import subprocess
 import sys
 import time
-import tempfile
 import urllib.error
 import urllib.request
 import zipfile
@@ -18,15 +17,12 @@ from pathlib import Path
 from typing import Callable
 
 from app_paths import app_root, ensure_ui_config, ui_config_path, user_config_dir
-from version import VERSION, version_string
+from version import version_string
 
-GITVERSE_OWNER = "delbraun"
-GITVERSE_REPO = "AutoRAWCompressor"
-GENERIC_PACKAGE = "AutoRAWCompressor"
-# GitVerse Releases API принимает ассеты только до ~3 MB; полный ZIP — в Generic Packages.
-MIN_RELEASE_ASSET_BYTES = 4 * 1024 * 1024
-RELEASES_PAGE = f"https://gitverse.ru/{GITVERSE_OWNER}/{GITVERSE_REPO}/releases"
-API_RELEASES = f"https://api.gitverse.ru/repos/{GITVERSE_OWNER}/{GITVERSE_REPO}/releases"
+GITHUB_OWNER = "divangames"
+GITHUB_REPO = "AutpRAW-Compressor"
+RELEASES_PAGE = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases"
+API_RELEASES = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases"
 
 ProgressCallback = Callable[[str, float, str], None]
 # (stage, percent 0-100, detail text)
@@ -43,46 +39,48 @@ class UpdateInfo:
 
 def _builtin_read_token() -> str:
     try:
-        from builtin_gitverse_read_token import BUILTIN_GITVERSE_READ_TOKEN
+        from builtin_github_read_token import BUILTIN_GITHUB_READ_TOKEN
 
-        return str(BUILTIN_GITVERSE_READ_TOKEN or "").strip()
+        return str(BUILTIN_GITHUB_READ_TOKEN or "").strip()
     except ImportError:
         return ""
 
 
-def gitverse_token_missing_message() -> str:
+def github_token_missing_message() -> str:
     ensure_ui_config()
     cfg = ui_config_path()
     return (
         "Не удалось скачать обновление.\n\n"
-        "Обычным пользователям токен не нужен — установите официальную сборку dist.\n"
-        "Для сборки из исходников задайте GITVERSE_READ_TOKEN при запуске build_dist.py.\n\n"
-        f"Опционально (разработчик): gitverse_token в\n{cfg}\n"
-        "или переменная GITVERSE_TOKEN."
+        "Для публичного репозитория токен обычно не нужен — проверьте интернет "
+        f"или скачайте вручную:\n{RELEASES_PAGE}\n\n"
+        "Для приватного репозитория задайте GITHUB_TOKEN при сборке "
+        "или github_token в\n"
+        f"{cfg}"
     )
 
 
-def gitverse_token() -> str:
-    token = os.environ.get("GITVERSE_TOKEN", "").strip()
+def github_token() -> str:
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
     if token:
         return token
     ensure_ui_config()
     try:
         cfg = json.loads(ui_config_path().read_text(encoding="utf-8"))
-        return str(cfg.get("gitverse_token", "")).strip()
+        return str(cfg.get("github_token") or "").strip()
     except Exception:
         return ""
 
 
-def gitverse_download_token() -> str:
-    """Токен для скачивания ZIP: свой пользовательский или встроенный read-only из сборки."""
-    return gitverse_token() or _builtin_read_token()
+def github_download_token() -> str:
+    """Токен для GitHub API/скачивания: пользовательский или встроенный из сборки."""
+    return github_token() or _builtin_read_token()
 
 
 def _api_headers(token: str) -> dict[str, str]:
     headers = {
-        "Accept": "application/vnd.gitverse.object+json;version=1",
+        "Accept": "application/vnd.github+json",
         "User-Agent": "AutoRAWCompressor",
+        "X-GitHub-Api-Version": "2022-11-28",
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -122,7 +120,7 @@ def _is_transient_network_error(exc: BaseException) -> bool:
 
 def _network_error_message() -> str:
     return (
-        "Не удалось связаться с GitVerse (ошибка SSL или сети).\n\n"
+        "Не удалось связаться с GitHub (ошибка SSL или сети).\n\n"
         "Проверьте интернет и повторите через минуту. "
         f"Обновление можно скачать вручную:\n{RELEASES_PAGE}"
     )
@@ -179,7 +177,7 @@ def _http_get_via_powershell(url: str, headers: dict[str, str], timeout: int) ->
         tail = (proc.stderr or proc.stdout or b"")[-500:].decode("utf-8", errors="replace")
         raise RuntimeError(tail)
     if not proc.stdout:
-        raise RuntimeError("Пустой ответ GitVerse")
+        raise RuntimeError("Пустой ответ GitHub")
     return proc.stdout
 
 
@@ -221,27 +219,6 @@ def _http_get_bytes(
 
 def _package_asset_name(version: str) -> str:
     return f"AutoRAWCompressor-{version.replace(' ', '_')}.zip"
-
-
-def _package_download_url(version: str) -> str:
-    name = _package_asset_name(version)
-    return (
-        f"https://gitverse.ru/api/packages/{GITVERSE_OWNER}/generic/"
-        f"{GENERIC_PACKAGE}/{version}/{name}"
-    )
-
-
-def _download_headers(token: str, url: str) -> dict[str, str]:
-    if "/api/packages/" in url and token:
-        import base64
-
-        basic = base64.b64encode(f"{GITVERSE_OWNER}:{token}".encode()).decode()
-        return {
-            "Accept": "*/*",
-            "User-Agent": "AutoRAWCompressor",
-            "Authorization": f"Basic {basic}",
-        }
-    return _api_headers(token)
 
 
 def parse_version(value: str) -> tuple[tuple[int, ...], str]:
@@ -309,34 +286,47 @@ def _version_from_release(release: dict, asset: dict | None) -> str:
 
 
 def _fetch_releases_json(token: str) -> list:
-    url = f"{API_RELEASES}?page=1&per_page=10"
-    headers = _api_headers(token) if token else {
-        "Accept": "application/vnd.gitverse.object+json;version=1",
-        "User-Agent": "AutoRAWCompressor",
-    }
+    url = f"{API_RELEASES}?per_page=10"
+    headers = _api_headers(token)
     try:
         raw = _http_get_bytes(url, headers, timeout=20)
         data = json.loads(raw.decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
             if token:
-                raise RuntimeError("GitVerse: неверный или просроченный токен (401).") from exc
-            raise RuntimeError("GitVerse: для проверки обновлений нужен токен (401).") from exc
+                raise RuntimeError("GitHub: неверный или просроченный токен (401).") from exc
+            raise RuntimeError(
+                "GitHub: для проверки обновлений нужен токен (401). "
+                "Задайте github_token в настройках или GITHUB_TOKEN."
+            ) from exc
         if exc.code == 403:
-            raise RuntimeError("GitVerse: доступ запрещён (403). Проверьте права токена.") from exc
-        raise RuntimeError(f"GitVerse API: HTTP {exc.code}") from exc
-    return data if isinstance(data, list) else data.get("releases") or data.get("items") or []
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            if "rate limit" in detail.lower():
+                raise RuntimeError(
+                    "GitHub: превышен лимит запросов (403). Повторите позже или задайте GITHUB_TOKEN."
+                ) from exc
+            raise RuntimeError("GitHub: доступ запрещён (403). Проверьте права токена.") from exc
+        if exc.code == 404:
+            raise RuntimeError(
+                f"GitHub: репозиторий {GITHUB_OWNER}/{GITHUB_REPO} не найден (404)."
+            ) from exc
+        raise RuntimeError(f"GitHub API: HTTP {exc.code}") from exc
+    return data if isinstance(data, list) else []
 
 
 def fetch_latest_update(token: str | None = None) -> UpdateInfo | None:
-    api_token = (token or gitverse_download_token()).strip()
-    releases: list = []
+    api_token = (token or github_download_token()).strip()
     try:
-        releases = _fetch_releases_json("")
-    except RuntimeError:
-        if not api_token:
-            raise RuntimeError(gitverse_token_missing_message())
         releases = _fetch_releases_json(api_token)
+    except RuntimeError as exc:
+        if api_token and "401" in str(exc):
+            releases = _fetch_releases_json("")
+        else:
+            raise
     if not releases:
         return None
 
@@ -349,14 +339,13 @@ def fetch_latest_update(token: str | None = None) -> UpdateInfo | None:
         if not is_newer_version(latest_ver, current):
             continue
         pkg_name = _package_asset_name(latest_ver)
-        asset_name = str(asset.get("name") or pkg_name) if asset else pkg_name
-        asset_size = int(asset.get("size") or 0) if asset else 0
-        download_url = str(asset.get("browser_download_url") or asset.get("url") or "") if asset else ""
-        # Portable ZIP всегда в Generic Packages (release-assets часто 401 или <3 MB).
-        download_url = _package_download_url(latest_ver)
-        asset_name = pkg_name
-        if asset_size < MIN_RELEASE_ASSET_BYTES:
-            asset_size = 0
+        if not asset:
+            continue
+        asset_name = str(asset.get("name") or pkg_name)
+        asset_size = int(asset.get("size") or 0)
+        download_url = str(asset.get("browser_download_url") or "")
+        if not download_url:
+            continue
         return UpdateInfo(
             version=latest_ver,
             release_name=str(release.get("name") or latest_ver),
@@ -426,33 +415,14 @@ def _download_stream(
                 on_progress("download", pct, detail)
 
 
-def _download_via_curl(url: str, dest: Path, token: str) -> None:
-    curl = Path(r"C:\Windows\System32\curl.exe")
-    if not curl.is_file():
-        raise RuntimeError("curl.exe не найден — не удалось скачать обновление.")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.run(
-        [
-            str(curl),
-            "-fSL",
-            "--ssl-no-revoke",
-            "--retry",
-            "3",
-            "--retry-delay",
-            "2",
-            "--user",
-            f"{GITVERSE_OWNER}:{token}",
-            "-o",
-            str(dest),
-            url,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=900,
-    )
-    if proc.returncode != 0:
-        tail = (proc.stderr or proc.stdout or "")[-500:]
-        raise RuntimeError(f"curl: ошибка загрузки ({proc.returncode}): {tail}")
+def _download_headers(token: str) -> dict[str, str]:
+    headers = {
+        "Accept": "application/octet-stream",
+        "User-Agent": "AutoRAWCompressor",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
 
 def download_file(
@@ -462,59 +432,71 @@ def download_file(
     on_progress: ProgressCallback | None = None,
     total_hint: int = 0,
 ) -> None:
-    token = (token or gitverse_download_token()).strip()
-    if not token:
-        raise RuntimeError(gitverse_token_missing_message())
-
+    token = (token or github_download_token()).strip()
     dest.parent.mkdir(parents=True, exist_ok=True)
-    header_attempts: list[dict[str, str] | None] = []
-    if "/api/packages/" in url:
-        header_attempts.extend([_api_headers(token), _download_headers(token, url), None])
-    else:
-        header_attempts.append(_api_headers(token))
+    headers = _download_headers(token)
 
     last_http: urllib.error.HTTPError | None = None
     last_network: Exception | None = None
-    for headers in header_attempts:
-        for attempt in range(3):
-            if attempt:
-                time.sleep(min(1.5 * attempt, 4.0))
-            try:
-                req = urllib.request.Request(url, headers=headers or {})
-                with urllib.request.urlopen(req, timeout=120, context=_ssl_context()) as resp:
-                    _download_stream(resp, dest, on_progress, total_hint)
-                if on_progress:
-                    on_progress("download", 100.0, "Загрузка завершена")
-                return
-            except urllib.error.HTTPError as exc:
-                last_http = exc
-                if exc.code not in (401, 403):
-                    raise RuntimeError(f"Ошибка загрузки: HTTP {exc.code}") from exc
-                break
-            except Exception as exc:
-                last_network = exc
-                if not _is_transient_network_error(exc):
-                    raise RuntimeError(f"Ошибка загрузки: {exc}") from exc
-
-    if sys.platform == "win32" and "/api/packages/" in url:
+    for attempt in range(3):
+        if attempt:
+            time.sleep(min(1.5 * attempt, 4.0))
         try:
-            if on_progress:
-                on_progress("download", 0.0, "Повтор через curl…")
-            _download_via_curl(url, dest, token)
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=120, context=_ssl_context()) as resp:
+                _download_stream(resp, dest, on_progress, total_hint)
             if on_progress:
                 on_progress("download", 100.0, "Загрузка завершена")
             return
+        except urllib.error.HTTPError as exc:
+            last_http = exc
+            if exc.code in (401, 403) and token:
+                token = ""
+                headers = _download_headers(token)
+                continue
+            if exc.code not in (401, 403):
+                raise RuntimeError(f"Ошибка загрузки: HTTP {exc.code}") from exc
+            break
         except Exception as exc:
-            if last_http is not None:
-                raise RuntimeError(
-                    "Не удалось скачать обновление (401). Установите официальную сборку dist "
-                    "или обновите приложение вручную с GitVerse Releases."
-                ) from exc
-            if last_network is not None and _is_transient_network_error(last_network):
-                raise RuntimeError(_network_error_message()) from last_network
-            raise
+            last_network = exc
+            if not _is_transient_network_error(exc):
+                raise RuntimeError(f"Ошибка загрузки: {exc}") from exc
+
+    if sys.platform == "win32":
+        curl = _curl_exe()
+        if curl.is_file():
+            try:
+                if on_progress:
+                    on_progress("download", 0.0, "Повтор через curl…")
+                args = [
+                    str(curl),
+                    "-fSL",
+                    "--ssl-no-revoke",
+                    "--retry",
+                    "3",
+                    "--retry-delay",
+                    "2",
+                    "-o",
+                    str(dest),
+                ]
+                if token:
+                    args.extend(["-H", f"Authorization: Bearer {token}"])
+                args.append(url)
+                proc = subprocess.run(args, capture_output=True, text=True, timeout=900)
+                if proc.returncode == 0:
+                    if on_progress:
+                        on_progress("download", 100.0, "Загрузка завершена")
+                    return
+            except Exception as exc:
+                if last_http is not None:
+                    raise RuntimeError(github_token_missing_message()) from exc
+                if last_network is not None and _is_transient_network_error(last_network):
+                    raise RuntimeError(_network_error_message()) from last_network
+                raise
 
     if last_http is not None:
+        if last_http.code in (401, 403):
+            raise RuntimeError(github_token_missing_message()) from last_http
         raise RuntimeError(f"Ошибка загрузки: HTTP {last_http.code}") from last_http
     if last_network is not None:
         raise RuntimeError(_network_error_message()) from last_network
@@ -649,7 +631,7 @@ def apply_update_and_restart(stage_dir: Path) -> None:
         exe_name=exe_name,
     )
     _launch_apply_script(script, target)
-    # Дать cmd стартовать до выхода процесса (иначе дочерний bat мог обрываться).
+    # Дать cmd стартовать до выхода процесса (иначе дочерний bat может обрываться).
     time.sleep(0.8)
     # sys.exit() из потока загрузки не закрывает Tk — процесс остаётся, bat висит на :wait_app.
     os._exit(0)
@@ -664,7 +646,7 @@ def run_update(
     if not ok:
         raise RuntimeError(reason)
 
-    token = (token or gitverse_download_token()).strip()
+    token = (token or github_download_token()).strip()
     cache = app_root() / "_update_cache"
     if cache.exists():
         shutil.rmtree(cache, ignore_errors=True)

@@ -1,4 +1,4 @@
-# Создаёт репозиторий AutoRAWCompressor на GitVerse (если есть GITVERSE_TOKEN) и пушит master.
+# Создаёт репозиторий AutoRAWCompressor на GitVerse (зеркало кода; релизы — на GitHub).
 param(
     [string]$Token = $env:GITVERSE_TOKEN,
     [string]$Owner = "delbraun",

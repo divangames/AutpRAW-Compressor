@@ -6,6 +6,7 @@ import sys
 import queue
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Windows: locale cp1251 ломает чтение stdout wmic/nvidia-smi/дроплетов в _readerthread
 _SUBPROC_TEXT = dict(capture_output=True, text=True, encoding="utf-8", errors="replace")
@@ -14,6 +15,7 @@ import math
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Iterable
 from tkinter import filedialog, messagebox, ttk
 
 import socket
@@ -61,8 +63,8 @@ from updater import (
     UpdateInfo,
     can_self_update,
     fetch_latest_update,
-    gitverse_download_token,
-    gitverse_token_missing_message,
+    github_download_token,
+    github_token_missing_message,
     run_update,
 )
 from autoraw_crop import (
@@ -130,6 +132,7 @@ FIG_ACCENT_H= "#6cb3ff"
 FIG_SEL     = "#1f4275"
 FIG_INPUT   = "#1a1a1a"
 FIG_BTN     = "#3c3c3c"
+FIG_SUCCESS = "#3dba6c"
 SL_TRACK    = "#111111"
 SL_ACTIVE   = "#4b9ef0"
 SL_THUMB    = "#a0a8b0"
@@ -280,6 +283,17 @@ def _save_export_mode_choice(choice: str) -> None:
     _save_config(cfg)
 
 
+def _load_load_mode_choice() -> str:
+    v = _load_config().get("load_mode", "fast")
+    return v if v in ("standard", "fast") else "fast"
+
+
+def _save_load_mode_choice(choice: str) -> None:
+    cfg = _load_config()
+    cfg["load_mode"] = choice
+    _save_config(cfg)
+
+
 def _load_outmax_label_products() -> bool:
     return bool(_load_config().get("outmax_label_products", False))
 
@@ -327,6 +341,42 @@ EXPORT_MODE_LABELS = {
     "standard": "Стандартный",
     "new": "Новый",
 }
+
+LOAD_MODE_LABELS = {
+    "standard": "Старый",
+    "fast": "Быстрый",
+}
+
+
+@dataclass(frozen=True)
+class LoadProfile:
+    preview_max_side: int
+    parallel_workers: int
+    skip_search_match_if_named: bool
+    lazy_crop: bool
+    fast_nef_read: bool
+
+
+LOAD_PROFILES: dict[str, LoadProfile] = {
+    "standard": LoadProfile(
+        preview_max_side=2600,
+        parallel_workers=1,
+        skip_search_match_if_named=False,
+        lazy_crop=False,
+        fast_nef_read=False,
+    ),
+    "fast": LoadProfile(
+        preview_max_side=1200,
+        parallel_workers=4,
+        skip_search_match_if_named=True,
+        lazy_crop=True,
+        fast_nef_read=True,
+    ),
+}
+
+
+def load_profile_for(mode: str) -> LoadProfile:
+    return LOAD_PROFILES.get(mode, LOAD_PROFILES["fast"])
 
 
 # Apply initial palette so module-level constants are set before class creation
@@ -385,6 +435,7 @@ class FrameState:
     temperature: int = STANDARD_TEMPERATURE
     tint: int = STANDARD_TINT
     thumb_cache: Image.Image | None = None
+    crop_pending: bool = False
 
 
 @dataclass
@@ -392,6 +443,7 @@ class FolderState:
     path: Path
     checked: bool = True
     frames: list[FrameState] | None = None
+    image_count: int | None = None
 
 
 def frame_sort_key(path: Path) -> tuple[int, str]:
@@ -414,6 +466,139 @@ def direct_image_files(folder: Path) -> list[Path]:
             by_frame[frame] = path
 
     return sorted(by_frame.values(), key=frame_sort_key)
+
+
+def _image_count_from_names(names: Iterable[str]) -> int:
+    priority = {".nef": 0, ".dng": 1, ".jpg": 2, ".jpeg": 2, ".png": 3, ".tif": 4, ".tiff": 4}
+    by_frame: dict[str, str] = {}
+    for name in names:
+        ext = Path(name).suffix.lower()
+        if ext not in IMAGE_EXTENSIONS:
+            continue
+        frame = frame_id(Path(name))
+        current = by_frame.get(frame)
+        if current is None or priority.get(ext, 9) < priority.get(Path(current).suffix.lower(), 9):
+            by_frame[frame] = name
+    return min(8, len(by_frame))
+
+
+def folder_image_count(folder: Path) -> int:
+    try:
+        names = [entry.name for entry in folder.iterdir() if entry.is_file()]
+    except OSError:
+        return 0
+    count = _image_count_from_names(names)
+    if count:
+        return count
+    return min(8, sum(1 for _ in image_files(folder)))
+
+
+def _frames_unambiguous_from_names(loaded: list[tuple[Path, Image.Image]]) -> bool:
+    frames: list[str] = []
+    for path, _img in loaded:
+        frame = frame_id(path)
+        if not (frame.isdigit() and 1 <= int(frame) <= 8):
+            return False
+        frames.append(frame)
+    return len(frames) == len(set(frames))
+
+
+def assign_frame_numbers(
+    loaded: list[tuple[Path, Image.Image]],
+    profile: LoadProfile,
+) -> list[tuple[Path, Image.Image, str, float | None]]:
+    if profile.skip_search_match_if_named and _frames_unambiguous_from_names(loaded):
+        result = [(path, img, frame_id(path), None) for path, img in loaded]
+        return sorted(result, key=lambda item: (int(item[2]) if item[2].isdigit() else 999, item[0].name.lower()))
+    return assign_frames_by_search(loaded)
+
+
+def _open_preview_for_profile(path: Path, profile: LoadProfile) -> Image.Image:
+    return open_preview(path, max_side=profile.preview_max_side, fast_raw=profile.fast_nef_read)
+
+
+def load_preview_images(
+    paths: list[Path],
+    profile: LoadProfile,
+    *,
+    on_progress: Callable[[int, int, Path], None] | None = None,
+) -> list[tuple[Path, Image.Image]]:
+    loaded: list[tuple[Path, Image.Image]] = []
+    total = len(paths)
+    if total == 0:
+        return loaded
+
+    if profile.parallel_workers <= 1:
+        for index, path in enumerate(paths, start=1):
+            if on_progress:
+                on_progress(index, total, path)
+            try:
+                loaded.append((path, _open_preview_for_profile(path, profile)))
+            except Exception:
+                pass
+        return loaded
+
+    order: dict[Path, int] = {path: index for index, path in enumerate(paths)}
+    results: dict[int, tuple[Path, Image.Image]] = {}
+    done = 0
+    with ThreadPoolExecutor(max_workers=profile.parallel_workers) as pool:
+        futures = {pool.submit(_open_preview_for_profile, path, profile): path for path in paths}
+        for future in as_completed(futures):
+            path = futures[future]
+            done += 1
+            if on_progress:
+                on_progress(done, total, path)
+            try:
+                results[order[path]] = (path, future.result())
+            except Exception:
+                pass
+    return [results[index] for index in sorted(results)]
+
+
+def ensure_frame_crop(state: FrameState, aspect: float) -> None:
+    if not state.crop_pending:
+        return
+    state.crop_box = crop_box_for_assigned_frame(state.path, state.image, aspect, state.frame)
+    state.crop_pending = False
+    state.thumb_cache = None
+
+
+def upgrade_frame_for_export(state: FrameState, aspect: float) -> None:
+    if max(state.image.size) < WORKING_MAX_SIDE:
+        state.image = open_preview(state.path, max_side=WORKING_MAX_SIDE, fast_raw=False)
+    state.crop_box = crop_box_for_assigned_frame(state.path, state.image, aspect, state.frame)
+    state.crop_pending = False
+    state.thumb_cache = None
+
+
+def build_frame_states(
+    loaded: list[tuple[Path, Image.Image]],
+    aspect: float,
+    profile: LoadProfile,
+) -> list[FrameState]:
+    assignments = assign_frame_numbers(loaded, profile)
+    frames: list[FrameState] = []
+    for path, img, frame, score in assignments:
+        if profile.lazy_crop:
+            state = FrameState(
+                path=path,
+                frame=frame,
+                image=img,
+                crop_box=Box(0, 0, img.width, img.height),
+                match_score=score,
+                crop_pending=True,
+            )
+        else:
+            state = FrameState(
+                path=path,
+                frame=frame,
+                image=img,
+                crop_box=crop_box_for_assigned_frame(path, img, aspect, frame),
+                match_score=score,
+            )
+        apply_saved_frame_layout(state)
+        frames.append(state)
+    return frames
 
 
 MATCH_SIZE = (96, 72)
@@ -698,6 +883,7 @@ def apply_frame_numbers_at_indices(
         frame_num = position_frame_number(index)
         state.frame = frame_num
         state.crop_box = crop_box_for_assigned_frame(state.path, state.image, aspect, frame_num)
+        state.crop_pending = False
         apply_saved_frame_layout(state)
         state.thumb_cache = None
         state.match_score = None
@@ -715,22 +901,37 @@ def is_export_folder(path: Path) -> bool:
 
 
 def discover_source_folders(root: Path) -> list[Path]:
+    root = root.resolve()
     folders: list[Path] = []
-    if has_direct_sources(root):
-        folders.append(root)
-
-    for path in sorted(root.rglob("*"), key=lambda p: str(p).lower()):
-        if path.is_dir() and not is_export_folder(path) and has_direct_sources(path):
-            folders.append(path)
-
     seen: set[Path] = set()
-    unique: list[Path] = []
-    for folder in folders:
-        resolved = folder.resolve()
-        if resolved not in seen:
-            seen.add(resolved)
-            unique.append(folder)
-    return unique
+
+    def try_add(folder: Path, names: list[str] | None = None) -> None:
+        key = folder.resolve()
+        if key in seen or is_export_folder(folder):
+            return
+        if names is not None:
+            has_images = _image_count_from_names(names) > 0
+        else:
+            has_images = has_direct_sources(folder)
+        if not has_images:
+            return
+        seen.add(key)
+        folders.append(folder)
+
+    try:
+        root_names = [entry.name for entry in root.iterdir() if entry.is_file()]
+    except OSError:
+        root_names = []
+    try_add(root, root_names)
+
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+        dirnames.sort(key=lambda name: name.lower())
+        current = Path(dirpath)
+        if current == root:
+            continue
+        try_add(current, filenames)
+
+    return sorted(folders, key=lambda p: str(p).lower())
 
 
 def fit_image(img: Image.Image, size: tuple[int, int]) -> Image.Image:
@@ -993,8 +1194,7 @@ class AutoRawGui(tk.Tk):
         self.load_token = 0
         self.loading_frames = False
         self.pending_folder: Path | None = None
-        self.tree_path_by_iid: dict[str, Path] = {}
-        self.tree_iid_by_path: dict[Path, str] = {}
+        self._folder_row_widgets: dict[Path, dict] = {}
         self.drop_window: tk.Toplevel | None = None
         self._drop_queue: queue.Queue[list] = queue.Queue()
         self._drop_close_win: tk.Toplevel | None = None
@@ -1025,6 +1225,7 @@ class AutoRawGui(tk.Tk):
         # Theme – must be set before _build_ui() applies palette
         self._theme_choice: str = _load_theme_choice()
         self._export_mode_choice: str = _load_export_mode_choice()
+        self._load_mode_choice: str = _load_load_mode_choice()
         dark = self._resolve_dark(self._theme_choice)
         _apply_palette("dark" if dark else "light")
         self._init_colorcor_vars()
@@ -1101,9 +1302,7 @@ class AutoRawGui(tk.Tk):
             if self.folder_states:
                 self.render_folder_tree()
                 if saved_folder and saved_folder in self.folder_states:
-                    iid = self.tree_iid_by_path.get(saved_folder)
-                    if iid:
-                        self.folder_tree.selection_set(iid)
+                    self._set_folder_row_selected(saved_folder)
                     fs = self.folder_states[saved_folder]
                     if fs.frames is not None:
                         self.render_thumbnails()
@@ -1125,6 +1324,23 @@ class AutoRawGui(tk.Tk):
         self._build_menubar(before=self._toolbar_bar)
         label = EXPORT_MODE_LABELS.get(mode, mode)
         self.set_progress(self.progress_var.get(), f"Режим экспорта: {label}")
+
+    def _change_load_mode(self, mode: str) -> None:
+        if mode == self._load_mode_choice:
+            return
+        self._load_mode_choice = mode
+        _save_load_mode_choice(mode)
+        self.load_token += 1
+        for folder_state in self.folder_states.values():
+            folder_state.frames = None
+        if self._menubar_frame is not None:
+            self._menubar_frame.destroy()
+            self._menubar_frame = None
+        self._build_menubar(before=self._toolbar_bar)
+        label = LOAD_MODE_LABELS.get(mode, mode)
+        self.set_progress(self.progress_var.get(), f"Режим загрузки: {label}")
+        if self.selected_folder and self.selected_folder in self.folder_states:
+            self.select_folder(self.selected_folder)
 
     def _set_window_icon(self, window: tk.Tk | tk.Toplevel | None = None) -> None:
         """Apply app icon to root or any child dialog."""
@@ -1312,6 +1528,32 @@ class AutoRawGui(tk.Tk):
             thickness=4,
             lightcolor=FIG_ACCENT,
             darkcolor=FIG_ACCENT,
+        )
+        st.configure("Horizontal.TProgressbar",
+            background=FIG_ACCENT,
+            troughcolor=FIG_INPUT,
+            borderwidth=0,
+            thickness=4,
+            lightcolor=FIG_ACCENT,
+            darkcolor=FIG_ACCENT,
+        )
+        st.layout("ExportQueue.Horizontal.TProgressbar", st.layout("Horizontal.TProgressbar"))
+        st.configure("ExportQueue.Horizontal.TProgressbar",
+            background=FIG_BORDER,
+            troughcolor=FIG_INPUT,
+            borderwidth=0,
+            thickness=4,
+            lightcolor=FIG_BORDER,
+            darkcolor=FIG_BORDER,
+        )
+        st.layout("ExportDone.Horizontal.TProgressbar", st.layout("Horizontal.TProgressbar"))
+        st.configure("ExportDone.Horizontal.TProgressbar",
+            background=FIG_SUCCESS,
+            troughcolor=FIG_SUCCESS,
+            borderwidth=0,
+            thickness=4,
+            lightcolor=FIG_SUCCESS,
+            darkcolor=FIG_SUCCESS,
         )
 
         # ── Entry ──────────────────────────────────────────────────
@@ -1948,8 +2190,21 @@ class AutoRawGui(tk.Tk):
                     command=lambda m=_mode: self._change_export_mode(m),
                 )
             )
+        load_mode_items: list[dict[str, object]] = []
+        for _lbl, _mode in (
+            ("Быстрый", "fast"),
+            ("Старый", "standard"),
+        ):
+            _is_cur = self._load_mode_choice == _mode
+            load_mode_items.append(
+                dict(
+                    label=("✓  " if _is_cur else "    ") + _lbl,
+                    command=lambda m=_mode: self._change_load_mode(m),
+                )
+            )
         settings_items: list[dict[str, object]] = [
             dict(label="Режим экспорта", children=export_mode_items),
+            dict(label="Режим загрузки", children=load_mode_items),
             dict(separator=True),
             dict(label="Уведомления от Zona…", command=self.show_zona_settings),
         ]
@@ -2064,35 +2319,39 @@ class AutoRawGui(tk.Tk):
         body = tk.Frame(self, bg=FIG_BG)
         body.pack(fill=tk.BOTH, expand=True)
 
-        # ── Left: folder tree ─────────────────────────────────────
-        left = tk.Frame(body, bg=FIG_BG, width=240)
+        # ── Left: folder list ─────────────────────────────────────
+        left = tk.Frame(body, bg=FIG_BG, width=300)
         left.pack(side=tk.LEFT, fill=tk.Y)
         left.pack_propagate(False)
         self._section_label(left, "Папки")
 
-        # Container: tree + thin scrollbar side-by-side
         _tree_frame = tk.Frame(left, bg=FIG_BG)
         _tree_frame.pack(fill=tk.BOTH, expand=True, padx=(6, 2), pady=(0, 6))
 
-        self.folder_tree = ttk.Treeview(_tree_frame, columns=("check", "count"),
-                                         show="tree headings", height=30)
-        self.folder_tree.heading("#0", text="Имя")
-        self.folder_tree.heading("check", text="✓")
-        self.folder_tree.heading("count", text="")
-        self.folder_tree.column("#0", width=155, stretch=True)
-        self.folder_tree.column("check", width=26, anchor=tk.CENTER, stretch=False)
-        self.folder_tree.column("count", width=28, anchor=tk.CENTER, stretch=False)
-
+        self._folder_list_canvas = tk.Canvas(_tree_frame, bg=FIG_BG, highlightthickness=0, bd=0)
         _folder_sb = self._win11_sb(
             _tree_frame, orient=tk.VERTICAL,
-            command=self.folder_tree.yview,
+            command=self._folder_list_canvas.yview,
         )
-        self.folder_tree.configure(yscrollcommand=_folder_sb.set)
+        self._folder_list_canvas.configure(yscrollcommand=_folder_sb.set)
         _folder_sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.folder_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._folder_list_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        self.folder_tree.bind("<<TreeviewSelect>>", self.on_folder_select)
-        self.folder_tree.bind("<Button-1>", self.on_folder_click)
+        self._folder_list_inner = tk.Frame(self._folder_list_canvas, bg=FIG_BG)
+        self._folder_list_window = self._folder_list_canvas.create_window(
+            (0, 0), window=self._folder_list_inner, anchor=tk.NW,
+        )
+
+        def _folder_list_inner_configure(_event: tk.Event) -> None:
+            self._folder_list_canvas.configure(scrollregion=self._folder_list_canvas.bbox("all"))
+
+        def _folder_list_canvas_configure(event: tk.Event) -> None:
+            self._folder_list_canvas.itemconfigure(self._folder_list_window, width=event.width)
+
+        self._folder_list_inner.bind("<Configure>", _folder_list_inner_configure)
+        self._folder_list_canvas.bind("<Configure>", _folder_list_canvas_configure)
+        self._folder_list_canvas.bind("<Enter>", lambda _e: self._bind_folder_list_wheel(True))
+        self._folder_list_canvas.bind("<Leave>", lambda _e: self._bind_folder_list_wheel(False))
 
         # left separator
         tk.Frame(body, bg=FIG_BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y)
@@ -2653,7 +2912,7 @@ class AutoRawGui(tk.Tk):
         lines.append("После установки приложение перезапустится.")
         return "\n".join(lines)
 
-    def _show_gitverse_token_toast(self) -> None:
+    def _show_github_auth_toast(self) -> None:
         def _open_settings() -> None:
             self._close_banner_toast()
             ensure_ui_config()
@@ -2667,8 +2926,8 @@ class AutoRawGui(tk.Tk):
 
         self._show_banner_toast(
             banner_file="MSG_Vers.png",
-            title="Нужен токен GitVerse",
-            detail=gitverse_token_missing_message(),
+            title="Не удалось скачать обновление",
+            detail=github_token_missing_message(),
             primary_text="Открыть настройки",
             on_primary=_open_settings,
             secondary_text="Позже",
@@ -2677,12 +2936,14 @@ class AutoRawGui(tk.Tk):
             auto_close_ms=None,
         )
 
-    def _is_gitverse_token_error(self, err: str) -> bool:
-        if gitverse_download_token().strip():
+    def _is_github_auth_error(self, err: str) -> bool:
+        if github_download_token().strip():
             return False
         low = err.lower()
-        return ("токен" in low and "gitverse" in low) or (
-            "401" in low and "gitverse" in low
+        return (
+            ("токен" in low and "github" in low)
+            or ("401" in low and "github" in low)
+            or ("403" in low and "лимит" in low)
         )
 
     def _show_export_success_toast(
@@ -3147,6 +3408,7 @@ class AutoRawGui(tk.Tk):
             if key in existing:
                 continue
             self.folder_states[key] = FolderState(path=source_folder)
+            self.folder_states[key].image_count = folder_image_count(source_folder)
             existing.add(key)
             added_paths.append(source_folder)
 
@@ -3186,11 +3448,9 @@ class AutoRawGui(tk.Tk):
         self.set_progress(0, "Ищу папки с исходниками...")
         self.root_folder = folder
         self.drop_var.set(str(folder))
-        for item in self.folder_tree.get_children():
-            self.folder_tree.delete(item)
-        selected = self.folder_tree.selection()
-        if selected:
-            self.folder_tree.selection_remove(selected)
+        for widget in self._folder_list_inner.winfo_children():
+            widget.destroy()
+        self._folder_row_widgets.clear()
         self.clear_frames_view("Идет поиск папок...")
 
         threading.Thread(target=self.discover_worker, args=(token, folder), daemon=True).start()
@@ -3216,75 +3476,183 @@ class AutoRawGui(tk.Tk):
         self.folder_states = {}
         for source_folder in found:
             previous = old_states.get(source_folder)
-            self.folder_states[source_folder] = previous if previous else FolderState(path=source_folder)
+            state = previous if previous else FolderState(path=source_folder)
+            if state.image_count is None:
+                state.image_count = folder_image_count(source_folder)
+            self.folder_states[source_folder] = state
 
         self.render_folder_tree()
         self.set_progress(100, f"Найдено папок: {len(found)} за {elapsed:.1f} сек.")
         first_folder = found[0]
         self.after(0, lambda: self.select_folder(first_folder))
 
+    def _bind_folder_list_wheel(self, active: bool) -> None:
+        if active:
+            self._folder_list_canvas.bind_all("<MouseWheel>", self._on_folder_list_wheel)
+        else:
+            self._folder_list_canvas.unbind_all("<MouseWheel>")
+
+    def _on_folder_list_wheel(self, event: tk.Event) -> None:
+        if not self._folder_list_canvas.winfo_exists():
+            return
+        x, y = self.winfo_pointerxy()
+        widget = self.winfo_containing(x, y)
+        if widget is None:
+            return
+        while widget is not None:
+            if widget is self._folder_list_canvas:
+                self._folder_list_canvas.yview_scroll(int(-event.delta / 120), "units")
+                return
+            widget = widget.master  # type: ignore[assignment]
+
+    def _folder_photo_count(self, folder: Path, state: FolderState) -> int:
+        if state.image_count is not None:
+            return state.image_count
+        return min(8, len(direct_image_files(folder)))
+
+    def _apply_folder_row_bg(self, row: dict, bg: str) -> None:
+        row["row"].configure(bg=bg)
+        row["bar_frame"].configure(bg=bg)
+        row["name_lbl"].configure(bg=bg)
+        row["count_lbl"].configure(bg=bg)
+        row["status_lbl"].configure(bg=bg)
+        row["chk"].configure(bg=bg)
+
+    def _set_folder_row_selected(self, folder: Path | None) -> None:
+        target = folder.resolve() if folder else None
+        for path, row in self._folder_row_widgets.items():
+            bg = FIG_SEL if target is not None and path == target else FIG_BG
+            self._apply_folder_row_bg(row, bg)
+
+    def _on_folder_check(self, folder: Path, checked: bool) -> None:
+        state = self.folder_states.get(folder.resolve())
+        if state:
+            state.checked = checked
+
+    def _on_folder_row_click(self, folder: Path, event: tk.Event) -> None:
+        widget = event.widget
+        if widget is self._folder_row_widgets[folder.resolve()]["chk"]:
+            return
+        while widget is not None:
+            if getattr(widget, "_checked", None) is not None:
+                return
+            widget = widget.master  # type: ignore[assignment]
+        self.select_folder(folder)
+
+    def _create_folder_row(self, folder: Path, state: FolderState) -> None:
+        key = folder.resolve()
+        bg = FIG_SEL if self.selected_folder and self.selected_folder.resolve() == key else FIG_BG
+        row_frame = tk.Frame(self._folder_list_inner, bg=bg, cursor="hand2")
+        row_frame.pack(fill=tk.X, pady=1)
+
+        chk = self._make_check(
+            row_frame,
+            state.checked,
+            lambda value, f=key: self._on_folder_check(f, value),
+            bg=bg,
+            tooltip_text="Галочка включает/исключает папку из экспорта",
+        )
+        chk.pack(side=tk.LEFT, padx=(2, 4))
+
+        name_lbl = tk.Label(
+            row_frame,
+            text=folder.name,
+            bg=bg,
+            fg=FIG_TEXT,
+            font=("Segoe UI", 9),
+            width=7,
+            anchor=tk.W,
+        )
+        name_lbl.pack(side=tk.LEFT)
+
+        photo_count = self._folder_photo_count(folder, state)
+        count_lbl = tk.Label(
+            row_frame,
+            text=str(photo_count),
+            bg=bg,
+            fg=FIG_TEXT2,
+            font=("Segoe UI", 8),
+            width=2,
+            anchor=tk.CENTER,
+        )
+        count_lbl.pack(side=tk.LEFT, padx=(0, 4))
+
+        bar_frame = tk.Frame(row_frame, bg=bg)
+        bar_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+
+        var = tk.DoubleVar(value=0)
+        bar = ttk.Progressbar(
+            bar_frame,
+            variable=var,
+            maximum=100,
+            style="ExportQueue.Horizontal.TProgressbar",
+        )
+
+        status_var = tk.StringVar(value="")
+        status_lbl = tk.Label(
+            row_frame,
+            textvariable=status_var,
+            bg=bg,
+            fg=FIG_TEXT2,
+            font=("Segoe UI", 8),
+            width=9,
+            anchor=tk.E,
+        )
+        status_lbl.pack(side=tk.RIGHT, padx=(0, 2))
+
+        click_targets = (row_frame, name_lbl, count_lbl, bar_frame, status_lbl)
+        for target in click_targets:
+            target.bind(
+                "<Button-1>",
+                lambda e, f=key: self._on_folder_row_click(f, e),
+            )
+
+        self._folder_row_widgets[key] = {
+            "row": row_frame,
+            "chk": chk,
+            "name_lbl": name_lbl,
+            "count_lbl": count_lbl,
+            "bar_frame": bar_frame,
+            "bar": bar,
+            "var": var,
+            "status_var": status_var,
+            "status_lbl": status_lbl,
+        }
+
     def render_folder_tree(self) -> None:
-        for item in self.folder_tree.get_children():
-            self.folder_tree.delete(item)
-        self.tree_path_by_iid.clear()
-        self.tree_iid_by_path.clear()
+        for widget in self._folder_list_inner.winfo_children():
+            widget.destroy()
+        self._folder_row_widgets.clear()
 
         if not self.root_folder:
             return
 
-        all_nodes: set[Path] = {self.root_folder}
-        for folder in self.folder_states:
-            current = folder
-            while True:
-                all_nodes.add(current)
-                if current == self.root_folder:
-                    break
-                current = current.parent
+        header = tk.Frame(self._folder_list_inner, bg=FIG_BG)
+        header.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(
+            header,
+            text=f"📁 {self.root_folder.name}",
+            bg=FIG_BG,
+            fg=FIG_TEXT,
+            font=("Segoe UI", 9, "bold"),
+            anchor=tk.W,
+        ).pack(side=tk.LEFT)
+        n_folders = len(self.folder_states)
+        if n_folders:
+            tk.Label(
+                header,
+                text=f"{n_folders} папок",
+                bg=FIG_BG,
+                fg=FIG_TEXT2,
+                font=("Segoe UI", 8),
+                anchor=tk.E,
+            ).pack(side=tk.RIGHT)
 
-        def sort_key(path: Path) -> tuple[int, str]:
-            try:
-                rel = path.relative_to(self.root_folder)
-                depth = len(rel.parts)
-                name = rel.parts[-1] if rel.parts else self.root_folder.name
-            except ValueError:
-                depth = 999
-                name = str(path)
-            return (depth, name.lower())
+        for folder in sorted(self.folder_states.keys(), key=lambda p: p.name.lower()):
+            self._create_folder_row(folder, self.folder_states[folder])
 
-        for node in sorted(all_nodes, key=sort_key):
-            parent = node.parent if node != self.root_folder else None
-            parent_iid = self.tree_iid_by_path.get(parent, "")
-            is_source = node in self.folder_states
-            state = self.folder_states.get(node)
-            check = "✓" if (state and state.checked) else (" " if is_source else "")
-            count = len(direct_image_files(node)[:8]) if is_source else ""
-            label = node.name if node != self.root_folder else self.root_folder.name
-            iid = f"node_{len(self.tree_path_by_iid)}"
-            self.folder_tree.insert(parent_iid, tk.END, iid=iid, text=label, values=(check, count), open=True)
-            self.tree_path_by_iid[iid] = node
-            self.tree_iid_by_path[node] = iid
-
-    def on_folder_click(self, event: tk.Event) -> None:
-        region = self.folder_tree.identify("region", event.x, event.y)
-        column = self.folder_tree.identify_column(event.x)
-        item = self.folder_tree.identify_row(event.y)
-        if region == "cell" and column == "#1" and item:
-            folder = self.tree_path_by_iid.get(item)
-            if folder is None:
-                return "break"
-            state = self.folder_states.get(folder)
-            if state:
-                state.checked = not state.checked
-                self.folder_tree.set(item, "check", "✓" if state.checked else " ")
-            return "break"
-        return None
-
-    def on_folder_select(self, _event: tk.Event) -> None:
-        selection = self.folder_tree.selection()
-        if selection:
-            folder = self.tree_path_by_iid.get(selection[0])
-            if folder and folder in self.folder_states:
-                self.select_folder(folder)
+        if self.selected_folder and self.selected_folder.resolve() in self._folder_row_widgets:
+            self._set_folder_row_selected(self.selected_folder)
 
     def select_folder(self, folder: Path) -> None:
         self._save_controls_to_current()
@@ -3297,9 +3665,7 @@ class AutoRawGui(tk.Tk):
             self.set_progress(self.progress_var.get(), f"Дождитесь загрузки. Следующая папка: {folder.name}")
             return
         self.selected_folder = folder
-        iid = self.tree_iid_by_path.get(folder)
-        if iid and tuple(self.folder_tree.selection()) != (iid,):
-            self.folder_tree.selection_set(iid)
+        self._set_folder_row_selected(folder)
         state = self.folder_states[folder]
         if state.frames is None:
             self.start_load_frames(folder)
@@ -3319,43 +3685,64 @@ class AutoRawGui(tk.Tk):
 
     def load_frames_worker(self, token: int, folder: Path) -> None:
         aspect = target_aspect(REFERENCE_DIR)
+        profile = load_profile_for(self._load_mode_choice)
         paths = direct_image_files(folder)[:8]
         total = len(paths)
-        loaded: list[tuple[Path, Image.Image]] = []
         start_time = time.monotonic()
 
-        for index, path in enumerate(paths, start=1):
+        def on_progress(done: int, count: int, path: Path) -> None:
             elapsed = time.monotonic() - start_time
-            eta = (elapsed / (index - 1) * (total - index + 1)) if index > 1 else 0.0
-            self.worker_events.put(("progress", token, index - 1, total, f"Открываю {path.name}", eta))
-            try:
-                img = open_preview(path, max_side=WORKING_MAX_SIDE)
-                loaded.append((path, img))
-            except Exception as exc:
-                self.worker_events.put(("warning", token, f"Не удалось открыть {path.name}:\n{exc}"))
+            eta = (elapsed / (done - 1) * (count - done + 1)) if done > 1 else 0.0
+            self.worker_events.put(("progress", token, done - 1, count, f"Открываю {path.name}", eta))
 
-        self.worker_events.put(("progress", token, total, total, "Определяю порядок кадров по search-эталонам", 0.0))
-        frames = [
-            frame_state_from_assignment(path, img, aspect, frame, score)
-            for path, img, frame, score in assign_frames_by_search(loaded)
-        ]
+        loaded = load_preview_images(paths, profile, on_progress=on_progress if total else None)
+        loaded_paths = {path for path, _ in loaded}
+        for path in paths:
+            if path not in loaded_paths:
+                self.worker_events.put(("warning", token, f"Не удалось открыть {path.name}"))
+
+        if profile.lazy_crop:
+            self.worker_events.put(("progress", token, total, total, "Готовлю превью кадров", 0.0))
+        else:
+            self.worker_events.put(("progress", token, total, total, "Определяю порядок кадров по search-эталонам", 0.0))
+        frames = build_frame_states(loaded, aspect, profile)
 
         elapsed = time.monotonic() - start_time
-        self.worker_events.put(("frames_done", token, folder, frames, elapsed))
+        self.worker_events.put(("frames_done", token, folder, frames, elapsed, profile.lazy_crop))
 
-    def finish_frames(self, token: int, folder: Path, frames: list[FrameState], elapsed: float) -> None:
+    def finish_frames(self, token: int, folder: Path, frames: list[FrameState], elapsed: float, lazy_crop: bool = False) -> None:
         if token != self.load_token or folder not in self.folder_states:
             return
         self.loading_frames = False
-        self.folder_states[folder].frames = frames
+        folder_state = self.folder_states[folder]
+        folder_state.frames = frames
+        folder_state.image_count = len(frames)
         self.selected_index = 0
         self.render_thumbnails()
         self.select_frame(0, save_previous=False)
-        self.set_progress(100, f"Загружено кадров: {len(frames)} за {elapsed:.1f} сек")
+        mode_label = LOAD_MODE_LABELS.get(self._load_mode_choice, self._load_mode_choice)
+        self.set_progress(100, f"Загружено кадров: {len(frames)} за {elapsed:.1f} сек ({mode_label})")
+        if lazy_crop:
+            threading.Thread(target=self._crop_frames_worker, args=(token, folder), daemon=True).start()
         if self.pending_folder and self.pending_folder != folder:
             pending = self.pending_folder
             self.pending_folder = None
             self.after(50, lambda: self.select_folder(pending))
+
+    def _crop_frames_worker(self, token: int, folder: Path) -> None:
+        try:
+            aspect = target_aspect(REFERENCE_DIR)
+            folder_state = self.folder_states.get(folder)
+            if not folder_state or not folder_state.frames:
+                return
+            for frame in folder_state.frames:
+                if token != self.load_token:
+                    return
+                if frame.crop_pending:
+                    ensure_frame_crop(frame, aspect)
+            self.worker_events.put(("crops_done", token, folder))
+        except Exception as exc:
+            self.worker_events.put(("warning", token, f"Ошибка автокадра:\n{exc}"))
 
     def load_frames_for_folder(self, folder: Path) -> list[FrameState]:
         state = self.folder_states[folder]
@@ -3363,19 +3750,15 @@ class AutoRawGui(tk.Tk):
             return state.frames
 
         aspect = target_aspect(REFERENCE_DIR)
-        loaded: list[tuple[Path, Image.Image]] = []
-        for path in direct_image_files(folder)[:8]:
-            try:
-                img = open_preview(path, max_side=WORKING_MAX_SIDE)
-                loaded.append((path, img))
-            except Exception as exc:
-                messagebox.showwarning(APP_NAME, f"Не удалось открыть {path.name}:\n{exc}")
-
-        frames = [
-            frame_state_from_assignment(path, img, aspect, frame, score)
-            for path, img, frame, score in assign_frames_by_search(loaded)
-        ]
+        profile = load_profile_for(self._load_mode_choice)
+        paths = direct_image_files(folder)[:8]
+        loaded = load_preview_images(paths, profile)
+        frames = build_frame_states(loaded, aspect, profile)
         state.frames = frames
+        state.image_count = len(frames)
+        if profile.lazy_crop:
+            for frame in frames:
+                ensure_frame_crop(frame, aspect)
         return frames
 
     def clear_frames_view(self, message: str) -> None:
@@ -3821,6 +4204,7 @@ class AutoRawGui(tk.Tk):
 
         self.selected_index = max(0, min(index, len(frames) - 1))
         state = frames[self.selected_index]
+        ensure_frame_crop(state, target_aspect(REFERENCE_DIR))
         self._updating_controls = True
         self.offset_x.set(state.offset_x)
         self.offset_y.set(state.offset_y)
@@ -5101,7 +5485,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
 
 ## Репозиторий
 
-`gitverse.ru/delbraun/AutoRAWCompressor`
+`github.com/divangames/AutpRAW-Compressor`
 """)
         ttk.Button(win, text="Закрыть", command=win.destroy).pack(pady=10)
 
@@ -5211,8 +5595,8 @@ AutoRAW Compressor — инструмент пакетной обработки 
             try:
                 info = fetch_latest_update()
             except Exception as exc:
-                if self._is_gitverse_token_error(str(exc)):
-                    self.after(0, self._show_gitverse_token_toast)
+                if self._is_github_auth_error(str(exc)):
+                    self.after(0, self._show_github_auth_toast)
                 return
             if info is None:
                 return
@@ -5309,7 +5693,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
         threading.Thread(target=_worker, daemon=True).start()
 
     def check_updates(self) -> None:
-        """Проверка, скачивание и автоустановка обновления с GitVerse."""
+        """Проверка, скачивание и автоустановка обновления с GitHub."""
         self._close_banner_toast()
         self._close_update_check_win()
         win = self._info_window(self, "Обновление", 480, 240)
@@ -5324,7 +5708,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
             font=("Segoe UI", 11, "bold"),
         ).pack(pady=(16, 4))
 
-        stage_var = tk.StringVar(value="Подключаемся к GitVerse…")
+        stage_var = tk.StringVar(value="Подключаемся к GitHub…")
         tk.Label(win, textvariable=stage_var, bg=FIG_BG, fg=FIG_TEXT2, font=("Segoe UI", 10)).pack(pady=(0, 8))
 
         progress_var = tk.DoubleVar(value=0)
@@ -5396,7 +5780,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
 
         def _worker() -> None:
             try:
-                self.after(0, lambda: set_ui("Проверка обновлений", 0, "Запрос к GitVerse…"))
+                self.after(0, lambda: set_ui("Проверка обновлений", 0, "Запрос к GitHub…"))
                 info = fetch_latest_update()
                 if info is None:
                     self.after(
@@ -5449,12 +5833,12 @@ AutoRAW Compressor — инструмент пакетной обработки 
                 err = str(exc)
 
                 def _fail() -> None:
-                    if self._is_gitverse_token_error(err):
+                    if self._is_github_auth_error(err):
                         try:
                             win.destroy()
                         except Exception:
                             pass
-                        self._show_gitverse_token_toast()
+                        self._show_github_auth_toast()
                         return
                     set_ui("Ошибка", 0, err)
                     messagebox.showerror("Обновление", err, parent=self)
@@ -5818,8 +6202,10 @@ AutoRAW Compressor — инструмент пакетной обработки 
             self._stop_thumb_reorder_progress()
         self.progress_bar.stop()
         self.progress_bar.configure(mode="determinate")
-        self.set_progress(0, "Готовлю экспорт...")
+        self._begin_folder_export_ui(checked_folders)
         n_folders = len(checked_folders)
+        root_hint = self.root_folder.name if self.root_folder else ""
+        self.set_progress(0, f"{n_folders} папок · {root_hint}" if root_hint else "Готовлю экспорт...")
         mode_label = EXPORT_MODE_LABELS.get(export_mode, export_mode)
         self._send_zona(
             f"🚀 <b>Экспорт запущен</b>\n"
@@ -5852,30 +6238,40 @@ AutoRAW Compressor — инструмент пакетной обработки 
         raw_droplet_warned = False
         intermediate_pngs: list[Path] = []
         total_units = 0
-        for folder in checked_folders:
+        folder_units: dict[Path, int] = {}
+
+        def work_units_for_folder(folder: Path) -> int:
             folder_state = self.folder_states.get(folder)
             if not folder_state:
-                continue
+                return 1
             if folder_state.frames is None:
                 source_paths = direct_image_files(folder)[:8]
-                total_units += len(source_paths) * 2
+                units = len(source_paths) * 2
                 if use_droplets and not new_export:
-                    total_units += len(source_paths)
+                    units += len(source_paths)
+                return max(1, units)
+            checked_frames = [frame for frame in folder_state.frames if frame.checked]
+            if not checked_frames:
+                return 1
+            if new_export:
+                nef_count = len(
+                    {
+                        nef
+                        for frame in checked_frames
+                        if (nef := nef_source_path(frame)) is not None
+                    }
+                )
+                units = nef_count + len(checked_frames)
             else:
-                checked_frames = [frame for frame in folder_state.frames if frame.checked]
-                if new_export:
-                    nef_count = len(
-                        {
-                            nef
-                            for frame in checked_frames
-                            if (nef := nef_source_path(frame)) is not None
-                        }
-                    )
-                    total_units += nef_count + len(checked_frames)
-                else:
-                    total_units += len(checked_frames)
-                if use_droplets:
-                    total_units += len([frame for frame in checked_frames if frame.frame in DROPLET_BY_FRAME])
+                units = len(checked_frames)
+            if use_droplets:
+                units += len([frame for frame in checked_frames if frame.frame in DROPLET_BY_FRAME])
+            return max(1, units)
+
+        for folder in checked_folders:
+            units = work_units_for_folder(folder)
+            folder_units[folder.resolve()] = units
+            total_units += units
         total_units = max(1, total_units)
         done_units = 0
         aspect = target_aspect(REFERENCE_DIR)
@@ -5892,7 +6288,11 @@ AutoRAW Compressor — инструмент пакетной обработки 
         def warn(text: str) -> None:
             self.worker_events.put(("warning", token, text))
 
-        def run_folder_droplets(folder_exports: list[tuple[Path, str]], folder_name: str) -> None:
+        def run_folder_droplets(
+            folder_exports: list[tuple[Path, str]],
+            folder_name: str,
+            on_unit_done: Callable[[str], None] | None = None,
+        ) -> None:
             nonlocal droplet_processed, done_units
             if not use_droplets or not folder_exports:
                 return
@@ -5965,6 +6365,8 @@ AutoRAW Compressor — инструмент пакетной обработки 
                         )
                     droplet_processed += 1
                     done_units += 1
+                    if on_unit_done:
+                        on_unit_done(f"Дроплет {droplet_name}")
 
         def run_raw_droplet(nef_path: Path) -> Path | None:
             nonlocal raw_droplet_warned
@@ -5999,37 +6401,53 @@ AutoRAW Compressor — инструмент пакетной обработки 
             if not folder_state:
                 continue
 
+            folder_key = folder.resolve()
+            folder_total = folder_units.get(folder_key, 1)
+            folder_done = 0
+
+            def advance_folder(label: str) -> None:
+                nonlocal folder_done
+                folder_done += 1
+                pct = (folder_done / folder_total * 100) if folder_total else 0
+                self.worker_events.put(
+                    ("folder_export", token, folder_key, "active", pct, label)
+                )
+
+            self.worker_events.put(
+                ("folder_export", token, folder_key, "active", 0, folder.name)
+            )
+
             frames = folder_state.frames
             if frames is None:
-                loaded: list[tuple[Path, Image.Image]] = []
                 paths = direct_image_files(folder)[:8]
+                export_profile = LOAD_PROFILES["standard"]
+                loaded: list[tuple[Path, Image.Image]] = []
                 for path in paths:
                     if stop_now():
                         break
                     report_progress(f"Открываю {folder.name}\\{path.name}")
                     try:
-                        img = open_preview(path, max_side=WORKING_MAX_SIDE)
-                        loaded.append((path, img))
+                        loaded.append((path, _open_preview_for_profile(path, export_profile)))
                     except Exception as exc:
                         warn(f"Не удалось открыть {path.name}:\n{exc}")
                     done_units += 1
+                    advance_folder(path.name)
                 if stop_now():
                     break
-                frames = [
-                    FrameState(
-                        path=path,
-                        frame=frame,
-                        image=img,
-                        crop_box=crop_box_for_assigned_frame(path, img, aspect, frame),
-                        match_score=score,
-                    )
-                    for path, img, frame, score in assign_frames_by_search(loaded)
-                ]
+                frames = build_frame_states(loaded, aspect, export_profile)
                 folder_state.frames = frames
 
             checked_frames = [frame for frame in frames if frame.checked]
             if not checked_frames:
+                self.worker_events.put(
+                    ("folder_export", token, folder_key, "done", 100, "Готово")
+                )
                 continue
+
+            for frame in checked_frames:
+                ensure_frame_crop(frame, aspect)
+                if not new_export and max(frame.image.size) < WORKING_MAX_SIDE:
+                    upgrade_frame_for_export(frame, aspect)
 
             output_dir = folder / folder.name
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -6055,6 +6473,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
                     report_progress(f"RAW: {raw_done}/{raw_total} — {folder.name}\\{nef_path.name}")
                     png_path = run_raw_droplet(nef_path)
                     done_units += 1
+                    advance_folder(nef_path.name)
                     if png_path is not None:
                         acr_outputs[nef_path] = png_path
                         intermediate_pngs.append(png_path)
@@ -6071,12 +6490,14 @@ AutoRAW Compressor — инструмент пакетной обработки 
                     report_progress(f"Кадрирование: {crop_done}/{crop_total} — {export_name}")
                     if png_path is None or not png_path.is_file():
                         done_units += 1
+                        advance_folder(export_name)
                         continue
                     try:
                         full_image = _load_export_source_image(png_path)
                     except Exception as exc:
                         warn(f"Не удалось открыть {png_path.name}:\n{exc}")
                         done_units += 1
+                        advance_folder(export_name)
                         continue
                     scaled_crop = scale_crop_box(
                         frame.crop_box,
@@ -6095,6 +6516,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
                     exported += 1
                     folder_exported += 1
                     done_units += 1
+                    advance_folder(export_name)
             else:
                 for frame in checked_frames:
                     if stop_now():
@@ -6112,11 +6534,20 @@ AutoRAW Compressor — инструмент пакетной обработки 
                     exported += 1
                     folder_exported += 1
                     done_units += 1
+                    advance_folder(export_name)
 
             if folder_exported:
                 exported_dirs.append(output_dir)
             if not stop_now() and folder_droplet_exports:
-                run_folder_droplets(folder_droplet_exports, folder.name)
+                run_folder_droplets(
+                    folder_droplet_exports,
+                    folder.name,
+                    on_unit_done=advance_folder,
+                )
+            if not stop_now():
+                self.worker_events.put(
+                    ("folder_export", token, folder_key, "done", 100, "Готово")
+                )
             if stop_now():
                 break
 
@@ -6143,6 +6574,47 @@ AutoRAW Compressor — инструмент пакетной обработки 
         self.progress_var.set(max(0, min(100, value)))
         self.progress_label.set(text)
 
+    def _begin_folder_export_ui(self, folders: list[Path]) -> None:
+        export_keys = {folder.resolve() for folder in folders}
+        for key, row in self._folder_row_widgets.items():
+            if key not in export_keys:
+                continue
+            row["var"].set(0)
+            row["status_var"].set("В очереди")
+            row["bar"].configure(style="ExportQueue.Horizontal.TProgressbar")
+            row["status_lbl"].configure(fg=FIG_TEXT2)
+            if not row["bar"].winfo_ismapped():
+                row["bar"].pack(fill=tk.X)
+
+    def _update_folder_export_row(
+        self,
+        folder: Path,
+        *,
+        status: str,
+        percent: float = 0,
+        text: str = "",
+    ) -> None:
+        key = folder.resolve()
+        row = self._folder_row_widgets.get(key)
+        if not row:
+            return
+        if not row["bar"].winfo_ismapped():
+            row["bar"].pack(fill=tk.X)
+        row["var"].set(max(0, min(100, percent)))
+        if status == "queue":
+            row["status_var"].set("В очереди")
+            row["bar"].configure(style="ExportQueue.Horizontal.TProgressbar")
+            row["status_lbl"].configure(fg=FIG_TEXT2)
+        elif status == "active":
+            row["status_var"].set(f"{int(percent)}%")
+            row["bar"].configure(style="Horizontal.TProgressbar")
+            row["status_lbl"].configure(fg=FIG_TEXT)
+        elif status == "done":
+            row["var"].set(100)
+            row["status_var"].set("Готово")
+            row["bar"].configure(style="ExportDone.Horizontal.TProgressbar")
+            row["status_lbl"].configure(fg=FIG_SUCCESS)
+
     def process_worker_events(self) -> None:
         while True:
             try:
@@ -6158,8 +6630,14 @@ AutoRAW Compressor — инструмент пакетной обработки 
                 _, token, found, elapsed = event
                 self.finish_add_folders(token, found, elapsed)
             elif kind == "frames_done":
-                _, token, folder, frames, elapsed = event
-                self.finish_frames(token, folder, frames, elapsed)
+                _, token, folder, frames, elapsed, *rest = event
+                lazy_crop = bool(rest[0]) if rest else False
+                self.finish_frames(token, folder, frames, elapsed, lazy_crop)
+            elif kind == "crops_done":
+                _, token, folder = event
+                if token == self.load_token and folder == self.selected_folder:
+                    self.render_thumbnails()
+                    self.render_preview()
             elif kind == "swap_done":
                 _, token, folder, from_index, to_index, ok = event
                 self._finish_swap_frames(token, folder, from_index, to_index, ok=ok)
@@ -6174,6 +6652,16 @@ AutoRAW Compressor — инструмент пакетной обработки 
                     percent = (done / total * 100) if total else 0
                     eta_text = f", осталось ~{eta:.0f} сек" if eta else ""
                     self.set_progress(percent, f"{label} ({done}/{total}{eta_text})")
+            elif kind == "folder_export":
+                _, token, folder, status, percent, text = event
+                if token != getattr(self, "_export_token", token):
+                    continue
+                self._update_folder_export_row(
+                    folder,
+                    status=status,
+                    percent=percent,
+                    text=text,
+                )
             elif kind == "export_done":
                 _, token, exported, droplet_processed, active_elapsed, cancelled, use_autoaction, exported_dirs = event
                 if token != getattr(self, "_export_token", token):

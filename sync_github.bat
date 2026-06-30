@@ -1,13 +1,12 @@
 @echo off
-rem Push code to GitVerse (mirror only; releases and updates — GitHub).
 setlocal EnableExtensions
 
 cd /d "%~dp0"
 
-set "REMOTE=gitverse"
+set "REMOTE=github"
 set "BRANCH=master"
-set "REPO_URL=https://gitverse.ru/delbraun/AutoRAWCompressor.git"
-set "REPO_WEB=https://gitverse.ru/delbraun/AutoRAWCompressor"
+set "REPO_URL=https://github.com/divangames/AutpRAW-Compressor.git"
+set "REPO_WEB=https://github.com/divangames/AutpRAW-Compressor"
 rem Fix "dubious ownership" when folder was created under another Windows user
 set "GIT_SAFE=-c safe.directory=%CD%"
 
@@ -16,7 +15,7 @@ if not exist ".git" (
     echo   git init
     echo   git add .
     echo   git commit -m "Initial commit"
-    echo Then run sync_gitverse.bat again.
+    echo Then run sync_github.bat again.
     pause
     exit /b 1
 )
@@ -31,20 +30,18 @@ if errorlevel 1 (
 )
 
 echo.
-echo Pushing %BRANCH% to GitVerse (%REMOTE%)...
+echo Pushing %BRANCH% to GitHub (%REMOTE%)...
 git %GIT_SAFE% push -u %REMOTE% %BRANCH%
 if errorlevel 1 (
     echo.
-    echo Push failed. Create empty repo on GitVerse first:
-    echo   https://gitverse.ru/new
-    echo Name: AutoRAWCompressor, without README / .gitignore
-    echo Repo: %REPO_WEB%
+    echo Push failed. Check access to:
+    echo   %REPO_WEB%
     echo.
     pause
     exit /b 1
 )
 
 echo.
-echo GitVerse is up to date: %REPO_WEB%
+echo GitHub is up to date: %REPO_WEB%
 pause
 exit /b 0

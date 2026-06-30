@@ -134,8 +134,7 @@ def image_files(root: Path) -> Iterable[Path]:
             yield path
 
 
-def extract_embedded_jpeg(path: Path, max_side: int = 1200) -> Image.Image | None:
-    data = path.read_bytes()
+def _decode_largest_jpeg_blob(data: bytes, max_side: int) -> Image.Image | None:
     starts: list[int] = []
     offset = 0
     while True:
@@ -171,13 +170,34 @@ def extract_embedded_jpeg(path: Path, max_side: int = 1200) -> Image.Image | Non
     if max_side:
         img.draft("RGB", (max_side, max_side))
     img.load()
-    img = img.convert("RGB")
+    return img.convert("RGB")
+
+
+def _read_raw_bytes_fast(path: Path, *, chunk_size: int = 2 * 1024 * 1024) -> bytes:
+    """Read RAW from the end in chunks — preview JPEG is usually near EOF."""
+    size = path.stat().st_size
+    if size <= chunk_size:
+        return path.read_bytes()
+
+    with path.open("rb") as handle:
+        handle.seek(max(0, size - chunk_size))
+        tail = handle.read()
+        if b"\xff\xd8\xff" in tail and b"\xff\xd9" in tail:
+            return tail
+        return path.read_bytes()
+
+
+def extract_embedded_jpeg(path: Path, max_side: int = 1200, *, fast_read: bool = False) -> Image.Image | None:
+    data = _read_raw_bytes_fast(path) if fast_read else path.read_bytes()
+    img = _decode_largest_jpeg_blob(data, max_side)
+    if img is None and fast_read:
+        img = _decode_largest_jpeg_blob(path.read_bytes(), max_side)
     return img
 
 
-def open_preview(path: Path, max_side: int = 1200) -> Image.Image:
+def open_preview(path: Path, max_side: int = 1200, *, fast_raw: bool = False) -> Image.Image:
     if path.suffix.lower() in {".nef", ".dng"}:
-        embedded = extract_embedded_jpeg(path, max_side=max_side)
+        embedded = extract_embedded_jpeg(path, max_side=max_side, fast_read=fast_raw)
         if embedded:
             img = embedded
         else:
@@ -358,10 +378,16 @@ def detect_object_on_image(img: Image.Image, rule: LayoutRule | None) -> tuple[B
     return scale_box(detected, analysis.size, img.size), confidence
 
 
-def compute_auto_crop_box(path: Path, img: Image.Image, aspect: float) -> Box:
+def compute_auto_crop_box(
+    path: Path,
+    img: Image.Image,
+    aspect: float,
+    object_box: Box | None = None,
+) -> Box:
     frame = frame_id(path)
     rule = LAYOUT_RULES.get(frame)
-    object_box, _ = detect_object_on_image(img, rule)
+    if object_box is None:
+        object_box, _ = detect_object_on_image(img, rule)
 
     if object_box and rule and not rule.manual_only:
         layout_box = expand_box(object_box, img.size, rule)
@@ -432,9 +458,17 @@ def expand_box(box: Box, image_size: tuple[int, int], rule: LayoutRule | None) -
     ).clamp(*image_size)
 
 
+_TARGET_ASPECT_CACHE: dict[Path, float] = {}
+
+
 def target_aspect(reference_dir: Path | None) -> float:
     if not reference_dir:
         return 4 / 3
+
+    key = reference_dir.resolve()
+    cached = _TARGET_ASPECT_CACHE.get(key)
+    if cached is not None:
+        return cached
 
     aspects: list[float] = []
     for path in image_files(reference_dir):
@@ -444,10 +478,9 @@ def target_aspect(reference_dir: Path | None) -> float:
         except Exception:
             continue
 
-    if not aspects:
-        return 4 / 3
-
-    return float(np.median(aspects))
+    result = float(np.median(aspects)) if aspects else 4 / 3
+    _TARGET_ASPECT_CACHE[key] = result
+    return result
 
 
 def frame_id(path: Path) -> str:

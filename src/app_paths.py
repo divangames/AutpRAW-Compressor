@@ -41,7 +41,7 @@ def _merge_config_dict(current: dict, other: dict) -> tuple[dict, bool]:
     merged = dict(current)
     changed = False
     for key in (
-        "gitverse_token",
+        "github_token",
         "theme",
         "export_mode",
         "etalon",
@@ -105,7 +105,7 @@ def ensure_ui_config() -> Path:
         {
             "theme": "system",
             "export_mode": "new",
-            "gitverse_token": "",
+            "github_token": "",
             "user_name": "Иван",
             "zona_chat_id": "",
             "zona_enabled": False,
