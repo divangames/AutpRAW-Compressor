@@ -1,6 +1,6 @@
 # AutoRAW Compressor
 
-**Версия: 0.0.2.10.Alpha**
+**Версия: 0.0.2.11.Alpha**
 
 <img width="1444" height="934" alt="image" src="https://github.com/user-attachments/assets/d46c6146-f43f-45e6-a735-7561586fade1" />
 

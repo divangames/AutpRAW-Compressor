@@ -248,18 +248,31 @@ def is_newer_version(latest: str, current: str) -> bool:
     return ln > cn
 
 
-def _pick_zip_asset(release: dict) -> dict | None:
+def _pick_update_asset(release: dict) -> dict | None:
     assets = release.get("assets") or []
-    zips = [a for a in assets if str(a.get("name", "")).lower().endswith(".zip")]
-    if not zips:
-        return None
 
-    def score(asset: dict) -> tuple[int, int]:
+    def score(asset: dict) -> tuple[int, int, int]:
         name = str(asset.get("name", "")).lower()
-        pref = 2 if "autoraw" in name else 1 if "compressor" in name else 0
-        return pref, int(asset.get("size") or 0)
+        ext_pref = 2 if name.endswith(".zip") else 1 if name.endswith(".msi") else 0
+        name_pref = 2 if "autoraw" in name else 1 if "compressor" in name else 0
+        return ext_pref, name_pref, int(asset.get("size") or 0)
 
-    return max(zips, key=score)
+    candidates = [
+        a
+        for a in assets
+        if str(a.get("name", "")).lower().endswith((".zip", ".msi"))
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=score)
+
+
+def _pick_zip_asset(release: dict) -> dict | None:
+    """Совместимость: только ZIP."""
+    asset = _pick_update_asset(release)
+    if asset and str(asset.get("name", "")).lower().endswith(".zip"):
+        return asset
+    return None
 
 
 def _version_from_release(release: dict, asset: dict | None) -> str:
@@ -334,14 +347,13 @@ def fetch_latest_update(token: str | None = None) -> UpdateInfo | None:
     for release in releases:
         if release.get("draft"):
             continue
-        asset = _pick_zip_asset(release)
+        asset = _pick_update_asset(release)
         latest_ver = _version_from_release(release, asset)
         if not is_newer_version(latest_ver, current):
             continue
-        pkg_name = _package_asset_name(latest_ver)
         if not asset:
             continue
-        asset_name = str(asset.get("name") or pkg_name)
+        asset_name = str(asset.get("name") or _package_asset_name(latest_ver))
         asset_size = int(asset.get("size") or 0)
         download_url = str(asset.get("browser_download_url") or "")
         if not download_url:
@@ -369,6 +381,23 @@ def can_self_update() -> tuple[bool, str]:
     except OSError:
         return False, f"Нет прав на запись в папку приложения:\n{root}"
     return True, ""
+
+
+def can_install_update(info: UpdateInfo) -> tuple[bool, str]:
+    """Можно ли установить обновление автоматически (ZIP — portable, MSI — установщик)."""
+    name = info.asset_name.lower()
+    if name.endswith(".zip"):
+        return can_self_update()
+    if name.endswith(".msi"):
+        if not getattr(sys, "frozen", False):
+            return False, "Запуск MSI-установщика доступен только в собранной версии (exe)."
+        if sys.platform != "win32":
+            return False, "MSI-установщик поддерживается только на Windows."
+        return True, ""
+    return False, (
+        f"Формат «{info.asset_name}» не поддерживается для автоустановки.\n\n"
+        f"Скачайте вручную: {RELEASES_PAGE}"
+    )
 
 
 def _format_bytes(n: int) -> str:
@@ -619,6 +648,28 @@ def _launch_apply_script(script: Path, target: Path) -> None:
     subprocess.Popen(["/bin/sh", str(script)], cwd=str(target), close_fds=True)
 
 
+def apply_msi_and_exit(msi_path: Path) -> None:
+    """Скачанный MSI: запуск установщика и выход из приложения."""
+    if sys.platform != "win32":
+        raise RuntimeError("MSI-установщик поддерживается только на Windows.")
+    msi = str(msi_path.resolve())
+    try:
+        os.startfile(msi)  # type: ignore[attr-defined]
+    except OSError:
+        flags = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        )
+        subprocess.Popen(
+            ["msiexec", "/i", msi],
+            creationflags=flags,
+            close_fds=True,
+        )
+    time.sleep(0.8)
+    os._exit(0)
+
+
 def apply_update_and_restart(stage_dir: Path) -> None:
     """Запускает фоновый bat и немедленно завершает процесс (иначе bat ждёт PID вечно)."""
     target = app_root()
@@ -642,7 +693,7 @@ def run_update(
     on_progress: ProgressCallback | None = None,
     token: str | None = None,
 ) -> None:
-    ok, reason = can_self_update()
+    ok, reason = can_install_update(info)
     if not ok:
         raise RuntimeError(reason)
 
@@ -652,16 +703,24 @@ def run_update(
         shutil.rmtree(cache, ignore_errors=True)
     cache.mkdir(parents=True, exist_ok=True)
 
-    zip_path = cache / info.asset_name
-    extract_dir = cache / "extracted"
+    dest_path = cache / info.asset_name
+    is_msi = info.asset_name.lower().endswith(".msi")
 
     if on_progress:
         on_progress("download", 0, f"Скачиваем {info.asset_name}…")
-    download_file(info.download_url, zip_path, token, on_progress, info.size)
+    download_file(info.download_url, dest_path, token, on_progress, info.size)
+
+    if is_msi:
+        if on_progress:
+            on_progress("apply", 100, "Запуск установщика Windows…")
+        apply_msi_and_exit(dest_path)
+        return
+
+    extract_dir = cache / "extracted"
 
     if on_progress:
         on_progress("extract", 0, "Распаковка архива…")
-    root = extract_zip(zip_path, extract_dir, on_progress)
+    root = extract_zip(dest_path, extract_dir, on_progress)
 
     if on_progress:
         on_progress("apply", 0, "Подготовка к установке…")

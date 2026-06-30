@@ -61,7 +61,7 @@ from version import APP_NAME, APP_TITLE, version_string
 from updater import (
     RELEASES_PAGE,
     UpdateInfo,
-    can_self_update,
+    can_install_update,
     fetch_latest_update,
     github_download_token,
     github_token_missing_message,
@@ -1226,6 +1226,8 @@ class AutoRawGui(tk.Tk):
         self._theme_choice: str = _load_theme_choice()
         self._export_mode_choice: str = _load_export_mode_choice()
         self._load_mode_choice: str = _load_load_mode_choice()
+        self.use_droplet_var = tk.BooleanVar(value=True)
+        self.use_autoaction_var = tk.BooleanVar(value=False)
         dark = self._resolve_dark(self._theme_choice)
         _apply_palette("dark" if dark else "light")
         self._init_colorcor_vars()
@@ -2211,7 +2213,19 @@ class AutoRawGui(tk.Tk):
         self._make_menubar_item(inner, "Настройки", settings_items)
 
         # ── Инструменты ─────────────────────────────────────────────
+        enable_tools_items: list[dict[str, object]] = [
+            dict(
+                label=("✓  " if self.use_droplet_var.get() else "    ") + "Дроплет",
+                command=self._toggle_use_droplet,
+            ),
+            dict(
+                label=("✓  " if self.use_autoaction_var.get() else "    ") + "АвтоЭкшен",
+                command=self._toggle_use_autoaction,
+            ),
+        ]
         tools_items: list[dict[str, object]] = [
+            dict(label="Включить инструменты", children=enable_tools_items),
+            dict(separator=True),
             dict(label="Цветокор…", command=self.show_colorcor_window),
             dict(separator=True),
             dict(label="АвтоЭкшен…", command=self.launch_autoaction),
@@ -2274,27 +2288,6 @@ class AutoRawGui(tk.Tk):
             width=9,
             command=self._cancel_export,
         )
-
-        # separator dot
-        tk.Frame(bar_inner, bg=FIG_BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y, pady=4)
-
-        self.use_droplet_var = tk.BooleanVar(value=False)
-        tk.Label(bar_inner, text="Дроплет", bg=FIG_PANEL, fg=FIG_TEXT2,
-                 font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(8, 4))
-        self._make_check(
-            bar_inner, False,
-            lambda value: self.use_droplet_var.set(value),
-            bg=FIG_PANEL,
-        ).pack(side=tk.LEFT)
-
-        self.use_autoaction_var = tk.BooleanVar(value=False)
-        tk.Label(bar_inner, text="АвтоЭкшен", bg=FIG_PANEL, fg=FIG_TEXT2,
-                 font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(10, 4))
-        self._make_check(
-            bar_inner, False,
-            self._on_autoaction_toggle,
-            bg=FIG_PANEL,
-        ).pack(side=tk.LEFT)
 
         # ── Status bar ───────────────────────────────────────────────
         sb = tk.Frame(self, bg=FIG_BG, height=22)
@@ -2632,10 +2625,25 @@ class AutoRawGui(tk.Tk):
         btn_row.pack(fill=tk.X, padx=12, pady=(0, 12))
         ttk.Button(btn_row, text="Закрыть", command=_close).pack(side=tk.RIGHT)
 
-    def _on_autoaction_toggle(self, value: bool) -> None:
-        self.use_autoaction_var.set(value)
-        if value:
+    def _refresh_menubar(self) -> None:
+        if self._menubar_frame is not None:
+            self._menubar_frame.destroy()
+            self._menubar_frame = None
+        self._build_menubar(before=self._toolbar_bar)
+
+    def _toggle_use_droplet(self) -> None:
+        new = not self.use_droplet_var.get()
+        self.use_droplet_var.set(new)
+        if new:
+            self.use_autoaction_var.set(False)
+        self._refresh_menubar()
+
+    def _toggle_use_autoaction(self) -> None:
+        new = not self.use_autoaction_var.get()
+        self.use_autoaction_var.set(new)
+        if new:
             self.use_droplet_var.set(False)
+        self._refresh_menubar()
 
     def _on_export_action(self) -> None:
         if self._export_running:
@@ -5572,7 +5580,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
 - **Стандартный** — экспорт из встроенного превью NEF (~2600 px по длинной стороне);
   цветокор из окна «Цветокор» применяется, если включён.
 
-После экспорта при необходимости можно включить **Дроплет** или **АвтоЭкшен** в верхней панели.
+После экспорта при необходимости включите **Дроплет** или **АвтоЭкшен** в меню **Инструменты → Включить инструменты**.
 """)
         ttk.Button(win, text="Закрыть", command=win.destroy).pack(pady=10)
 
@@ -5626,7 +5634,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
         self._close_banner_toast()
         self._close_update_check_win()
         self._clear_pending_update()
-        ok, reason = can_self_update()
+        ok, reason = can_install_update(info)
         if not ok:
             messagebox.showinfo(
                 "Обновление",
@@ -5794,7 +5802,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
                     self.after(0, enable_close)
                     return
 
-                ok, reason = can_self_update()
+                ok, reason = can_install_update(info)
                 if not ok:
                     self.after(
                         0,
