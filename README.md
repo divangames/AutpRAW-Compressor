@@ -2,6 +2,9 @@
 
 **Версия: 0.0.2.10.Alpha**
 
+<img width="1444" height="934" alt="image" src="https://github.com/user-attachments/assets/d46c6146-f43f-45e6-a735-7561586fade1" />
+
+
 Прототип массового автокадрирования для съёмки кроссовок: распознаёт товар на светлом фоне, применяет правила посадки по номеру кадра и готовит план кропа для Photoshop. Есть CLI и GUI с ручной подстройкой и экспортом.
 
 Репозиторий: [github.com/divangames/AutpRAW-Compressor](https://github.com/divangames/AutpRAW-Compressor)
