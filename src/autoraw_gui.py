@@ -493,6 +493,11 @@ def folder_image_count(folder: Path) -> int:
     return min(8, sum(1 for _ in image_files(folder)))
 
 
+ALL_FRAME_NUMBERS = tuple(f"{index:02d}" for index in range(1, 9))
+# signature_distance above this → match too weak for auto-assign (confidence < 55%)
+MATCH_SCORE_THRESHOLD = 0.45
+
+
 def _frames_unambiguous_from_names(loaded: list[tuple[Path, Image.Image]]) -> bool:
     frames: list[str] = []
     for path, _img in loaded:
@@ -503,11 +508,28 @@ def _frames_unambiguous_from_names(loaded: list[tuple[Path, Image.Image]]) -> bo
     return len(frames) == len(set(frames))
 
 
+def missing_frame_numbers(assigned: Iterable[str]) -> list[str]:
+    """Frame slots 01..08 with no assigned photo."""
+    used = {frame for frame in assigned if frame.isdigit() and 1 <= int(frame) <= 8}
+    return [frame for frame in ALL_FRAME_NUMBERS if frame not in used]
+
+
+def _format_missing_frames(frames: list[str]) -> str:
+    if not frames:
+        return ""
+    return ", ".join(str(int(frame)) for frame in frames)
+
+
 def assign_frame_numbers(
     loaded: list[tuple[Path, Image.Image]],
     profile: LoadProfile,
 ) -> list[tuple[Path, Image.Image, str, float | None]]:
-    if profile.skip_search_match_if_named and _frames_unambiguous_from_names(loaded):
+    # Incomplete sets must use visual search — filenames are often sequential 01..N.
+    if (
+        profile.skip_search_match_if_named
+        and len(loaded) == len(ALL_FRAME_NUMBERS)
+        and _frames_unambiguous_from_names(loaded)
+    ):
         result = [(path, img, frame_id(path), None) for path, img in loaded]
         return sorted(result, key=lambda item: (int(item[2]) if item[2].isdigit() else 999, item[0].name.lower()))
     return assign_frames_by_search(loaded)
@@ -681,6 +703,19 @@ def _load_search_signatures() -> dict[str, tuple[list[float], list[float], tuple
     return signatures
 
 
+def _best_match_for_index(
+    pairs: list[tuple[float, int, str]],
+    index: int,
+) -> tuple[str, float] | None:
+    best: tuple[str, float] | None = None
+    for score, pair_index, frame in pairs:
+        if pair_index != index:
+            continue
+        if best is None or score < best[1]:
+            best = (frame, score)
+    return best
+
+
 def assign_frames_by_search(
     loaded: list[tuple[Path, Image.Image]],
 ) -> list[tuple[Path, Image.Image, str, float | None]]:
@@ -705,6 +740,8 @@ def assign_frames_by_search(
     assigned_by_index: dict[int, tuple[str, float]] = {}
     used_frames: set[str] = set()
     for score, index, frame in pairs:
+        if score > MATCH_SCORE_THRESHOLD:
+            continue
         if index in assigned_by_index or frame in used_frames:
             continue
         assigned_by_index[index] = (frame, score)
@@ -712,15 +749,26 @@ def assign_frames_by_search(
         if len(assigned_by_index) == min(len(loaded), len(refs)):
             break
 
-    fallback_frames = [frame for frame in sorted(refs, key=lambda f: int(f)) if frame not in used_frames]
     result: list[tuple[Path, Image.Image, str, float | None]] = []
     for index, (path, img) in enumerate(loaded):
         if index in assigned_by_index:
             frame, score = assigned_by_index[index]
-        elif fallback_frames:
-            frame, score = fallback_frames.pop(0), None
         else:
-            frame, score = frame_id(path), None
+            name_frame = frame_id(path)
+            if (
+                name_frame.isdigit()
+                and 1 <= int(name_frame) <= 8
+                and name_frame not in used_frames
+            ):
+                frame, score = name_frame, None
+                used_frames.add(frame)
+            else:
+                best = _best_match_for_index(pairs, index)
+                if best is not None and best[0] not in used_frames:
+                    frame, score = best
+                    used_frames.add(frame)
+                else:
+                    frame, score = frame_id(path), best[1] if best else None
         result.append((path, img, frame, score))
 
     return sorted(result, key=lambda item: (int(item[2]) if item[2].isdigit() else 999, item[0].name.lower()))
@@ -729,6 +777,59 @@ def assign_frames_by_search(
 def crop_box_for_assigned_frame(path: Path, img: Image.Image, aspect: float, frame: str) -> Box:
     fake_path = Path(f"{frame}{path.suffix}")
     return compute_auto_crop_box(fake_path, img, aspect)
+
+
+def frame_badge_text(state: FrameState) -> str:
+    score_text = ""
+    if state.match_score is not None:
+        confidence = max(0, min(99, int(round((1.0 - state.match_score) * 100))))
+        score_text = f" · {confidence}%"
+    return f"  {state.frame}{score_text}"
+
+
+def reapply_frame_assignment(
+    state: FrameState,
+    aspect: float,
+    frame: str,
+    *,
+    match_score: float | None = None,
+) -> None:
+    state.frame = frame
+    state.match_score = match_score
+    state.crop_box = crop_box_for_assigned_frame(state.path, state.image, aspect, frame)
+    state.crop_pending = False
+    apply_saved_frame_layout(state)
+    state.thumb_cache = None
+
+
+def assign_frame_to_index(
+    frames: list[FrameState],
+    index: int,
+    new_frame: str,
+    aspect: float,
+) -> int | None:
+    """Assign frame number to one photo; swap numbers if the slot is taken."""
+    if not (0 <= index < len(frames)):
+        return None
+    if not (new_frame.isdigit() and 1 <= int(new_frame) <= 8):
+        return None
+    new_frame = f"{int(new_frame):02d}"
+
+    current = frames[index]
+    if current.frame == new_frame:
+        return None
+
+    other_index: int | None = None
+    for i, state in enumerate(frames):
+        if i != index and state.frame == new_frame:
+            other_index = i
+            break
+
+    old_frame = current.frame
+    reapply_frame_assignment(current, aspect, new_frame, match_score=None)
+    if other_index is not None:
+        reapply_frame_assignment(frames[other_index], aspect, old_frame, match_score=None)
+    return other_index
 
 
 def apply_saved_frame_layout(state: FrameState) -> None:
@@ -778,6 +879,101 @@ def export_name_for_frame(frame: FrameState) -> str:
     if frame.frame.isdigit():
         return f"{int(frame.frame)}.jpg"
     return f"{frame.path.stem}.jpg"
+
+
+EXPORT_STATE_FILE = ".autoraw-export-state.json"
+
+
+def _export_state_path(output_dir: Path) -> Path:
+    return output_dir / EXPORT_STATE_FILE
+
+
+def _load_export_state(output_dir: Path) -> dict[str, object]:
+    path = _export_state_path(output_dir)
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _save_export_state(output_dir: Path, state: dict[str, object]) -> None:
+    _export_state_path(output_dir).write_text(
+        json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def _state_raw_outputs(state: dict[str, object]) -> dict[str, str]:
+    raw = state.get("raw_outputs")
+    if not isinstance(raw, dict):
+        raw = {}
+        state["raw_outputs"] = raw
+    normalized = {str(key): str(value) for key, value in raw.items()}
+    raw.clear()
+    raw.update(normalized)
+    return raw
+
+
+def _state_files(state: dict[str, object], key: str) -> set[str]:
+    value = state.get(key)
+    if not isinstance(value, list):
+        value = []
+        state[key] = value
+    return {str(item) for item in value}
+
+
+def _state_set_files(state: dict[str, object], key: str, files: set[str]) -> None:
+    state[key] = sorted(files, key=str.lower)
+
+
+def _nef_state_key(path: Path) -> str:
+    return str(path.resolve()).lower()
+
+
+def _has_export_checkpoint(folder: Path) -> bool:
+    output_dir = folder / folder.name
+    state = _load_export_state(output_dir)
+    if not state:
+        return False
+    raw_outputs = _state_raw_outputs(state)
+    if any(Path(path).is_file() for path in raw_outputs.values()):
+        return True
+    exported_outputs = _state_files(state, "exported_outputs")
+    if any((output_dir / name).is_file() for name in exported_outputs):
+        return True
+    droplet_outputs = _state_files(state, "droplet_outputs")
+    return any((output_dir / name).is_file() for name in droplet_outputs)
+
+
+def _format_stage_timings(stage_timings: dict[str, float]) -> list[str]:
+    order = (
+        ("raw", "RAW"),
+        ("crop", "Кадрирование"),
+        ("droplet", "Дроплеты"),
+    )
+    lines: list[str] = []
+    for key, label in order:
+        value = float(stage_timings.get(key, 0.0) or 0.0)
+        if value > 0:
+            lines.append(f"{label}: {value:.1f} сек")
+    return lines
+
+
+def _format_stage_timings_short(stage_timings: dict[str, float]) -> str:
+    parts: list[str] = []
+    raw = float(stage_timings.get("raw", 0.0) or 0.0)
+    crop = float(stage_timings.get("crop", 0.0) or 0.0)
+    droplet = float(stage_timings.get("droplet", 0.0) or 0.0)
+    if raw > 0:
+        parts.append(f"R {raw:.1f}")
+    if crop > 0:
+        parts.append(f"C {crop:.1f}")
+    if droplet > 0:
+        parts.append(f"D {droplet:.1f}")
+    return " · ".join(parts)
 
 
 def nef_source_path(frame: FrameState) -> Path | None:
@@ -845,6 +1041,149 @@ def _load_export_source_image(path: Path) -> Image.Image:
     with Image.open(path) as img:
         img.load()
         return ImageOps.exif_transpose(img).convert("RGB")
+
+
+@dataclass(frozen=True)
+class _RenderPlan:
+    source_box: Box
+    source_size: tuple[int, int]
+    sample_size: tuple[int, int]
+    output_size: tuple[int, int]
+    sample_left: float
+    sample_top: float
+    scale_src: float
+
+
+def _compute_render_plan(
+    state: FrameState,
+    source_size: tuple[int, int],
+    box: Box,
+    output_size: tuple[int, int],
+) -> _RenderPlan | None:
+    width, height = source_size
+    box = box.clamp(width, height)
+    if box.width <= 0 or box.height <= 0:
+        return None
+
+    zoom = max(0.2, float(state.zoom or 1.0))
+    rotation = float(state.rotation or 0.0)
+    if abs(rotation) < 0.05:
+        rotation = 0.0
+
+    theta = abs(math.radians(rotation))
+    sin_t = abs(math.sin(theta))
+    cos_t = abs(math.cos(theta))
+
+    if rotation:
+        zoom = max(1.0, zoom)
+
+    viewport_w = max(1.0, box.width / zoom)
+    viewport_h = max(1.0, box.height / zoom)
+
+    target_ar = output_size[0] / output_size[1]
+    if viewport_w / viewport_h > target_ar:
+        viewport_h = viewport_w / target_ar
+    else:
+        viewport_w = viewport_h * target_ar
+
+    base_cx = (box.left + box.right) / 2.0
+    base_cy = (box.top + box.bottom) / 2.0
+    canvas_w, canvas_h = float(CANVAS_SIZE[0]), float(CANVAS_SIZE[1])
+    dx_screen = state.offset_x * viewport_w / canvas_w
+    dy_screen = state.offset_y * viewport_h / canvas_h
+    cx = base_cx - dx_screen
+    cy = base_cy - dy_screen
+
+    rot_bbox_w = cos_t * viewport_w + sin_t * viewport_h
+    rot_bbox_h = sin_t * viewport_w + cos_t * viewport_h
+    min_cx = rot_bbox_w / 2.0
+    max_cx = float(width) - rot_bbox_w / 2.0
+    min_cy = rot_bbox_h / 2.0
+    max_cy = float(height) - rot_bbox_h / 2.0
+    if min_cx > max_cx:
+        cx = float(width) / 2.0
+    else:
+        cx = max(min_cx, min(max_cx, cx))
+    if min_cy > max_cy:
+        cy = float(height) / 2.0
+    else:
+        cy = max(min_cy, min(max_cy, cy))
+
+    if rotation:
+        rot_factor_x = (cos_t * float(output_size[0]) + sin_t * float(output_size[1])) / max(1.0, float(output_size[0]))
+        rot_factor_y = (sin_t * float(output_size[0]) + cos_t * float(output_size[1])) / max(1.0, float(output_size[1]))
+        sample_size = (
+            max(output_size[0], int(math.ceil(output_size[0] * rot_factor_x))),
+            max(output_size[1], int(math.ceil(output_size[1] * rot_factor_y))),
+        )
+    else:
+        sample_size = output_size
+
+    scale_src = viewport_w / output_size[0]
+    sample_left = cx - (sample_size[0] * scale_src) / 2.0
+    sample_top = cy - (sample_size[1] * scale_src) / 2.0
+    sample_right = cx + (sample_size[0] * scale_src) / 2.0
+    sample_bottom = cy + (sample_size[1] * scale_src) / 2.0
+    source_box = Box(
+        int(math.floor(sample_left)),
+        int(math.floor(sample_top)),
+        int(math.ceil(sample_right)),
+        int(math.ceil(sample_bottom)),
+    ).clamp(width, height)
+    return _RenderPlan(
+        source_box=source_box,
+        source_size=(width, height),
+        sample_size=sample_size,
+        output_size=output_size,
+        sample_left=sample_left,
+        sample_top=sample_top,
+        scale_src=viewport_w / output_size[0],
+    )
+
+
+def _render_frame_from_path(
+    state: FrameState,
+    source_path: Path,
+    crop_box: Box,
+    size: tuple[int, int] = CANVAS_SIZE,
+) -> Image.Image:
+    with Image.open(source_path) as opened:
+        opened = ImageOps.exif_transpose(opened)
+        plan = _compute_render_plan(state, opened.size, crop_box, size)
+        if plan is None:
+            return Image.new("RGB", size, "white")
+
+        # Decode only the local region needed for the current viewport instead
+        # of keeping a full-resolution export image in memory for every frame.
+        region = opened.crop(
+            (
+                plan.source_box.left,
+                plan.source_box.top,
+                plan.source_box.right,
+                plan.source_box.bottom,
+            )
+        ).convert("RGB")
+        shifted_crop = Box(
+            crop_box.left - plan.source_box.left,
+            crop_box.top - plan.source_box.top,
+            crop_box.right - plan.source_box.left,
+            crop_box.bottom - plan.source_box.top,
+        )
+        shifted_plan = _RenderPlan(
+            source_box=Box(
+                0,
+                0,
+                plan.source_box.width,
+                plan.source_box.height,
+            ),
+            source_size=region.size,
+            sample_size=plan.sample_size,
+            output_size=plan.output_size,
+            sample_left=plan.sample_left - plan.source_box.left,
+            sample_top=plan.sample_top - plan.source_box.top,
+            scale_src=plan.scale_src,
+        )
+        return _render_frame_with_plan(state, region, shifted_crop, shifted_plan, size)
 
 
 def _save_export_jpeg(output: Image.Image, output_path: Path) -> None:
@@ -965,6 +1304,32 @@ def _srgb_icc_profile() -> bytes:
     return _SRGB_ICC_CACHE
 
 
+def _render_frame_with_plan(
+    state: FrameState,
+    source: Image.Image,
+    crop_box: Box,
+    plan: _RenderPlan,
+    size: tuple[int, int],
+) -> Image.Image:
+    rotation = float(state.rotation or 0.0)
+    if abs(rotation) < 0.05:
+        rotation = 0.0
+    frame = source.transform(
+        plan.sample_size,
+        Image.Transform.AFFINE,
+        (plan.scale_src, 0.0, plan.sample_left, 0.0, plan.scale_src, plan.sample_top),
+        resample=Image.Resampling.BICUBIC,
+    )
+
+    if rotation:
+        frame = frame.rotate(rotation, resample=Image.Resampling.BICUBIC, expand=False)
+        crop_left = max(0, (plan.sample_size[0] - size[0]) // 2)
+        crop_top = max(0, (plan.sample_size[1] - size[1]) // 2)
+        frame = frame.crop((crop_left, crop_top, crop_left + size[0], crop_top + size[1]))
+
+    return frame
+
+
 def render_frame(
     state: FrameState,
     size: tuple[int, int] = CANVAS_SIZE,
@@ -977,96 +1342,10 @@ def render_frame(
     # appearing too early when the user adjusts the frame.
     source = source_image if source_image is not None else state.image
     box = crop_box if crop_box is not None else state.crop_box
-    box = box.clamp(source.width, source.height)
-    if box.width <= 0 or box.height <= 0:
+    plan = _compute_render_plan(state, source.size, box, size)
+    if plan is None:
         return Image.new("RGB", size, "white")
-
-    zoom = max(0.2, float(state.zoom or 1.0))
-    rotation = float(state.rotation or 0.0)
-    if abs(rotation) < 0.05:
-        rotation = 0.0
-
-    theta = abs(math.radians(rotation))
-    sin_t = abs(math.sin(theta))
-    cos_t = abs(math.cos(theta))
-
-    # Не усиливаем зум при повороте: пользовательский масштаб должен
-    # оставаться тем, который выставлен на слайдере.
-    if rotation:
-        zoom = max(1.0, zoom)
-
-    viewport_w = max(1.0, box.width / zoom)
-    viewport_h = max(1.0, box.height / zoom)
-
-    # Единый масштаб по X и Y — иначе при crop_box с аспектом != аспект холста
-    # (например, когда кроп упёрся в край исходника и был обрезан clamp) кадр
-    # растягивается. Расширяем недостающую сторону вьюпорта до аспекта холста,
-    # чтобы scale_src_x == scale_src_y и деформация была невозможна на любом
-    # экране/разрешении.
-    target_ar = size[0] / size[1]
-    if viewport_w / viewport_h > target_ar:
-        viewport_h = viewport_w / target_ar
-    else:
-        viewport_w = viewport_h * target_ar
-    scale_src = viewport_w / size[0]
-    scale_src_x = scale_src
-    scale_src_y = scale_src
-
-    base_cx = (box.left + box.right) / 2.0
-    base_cy = (box.top + box.bottom) / 2.0
-    # Смещения заданы в пикселях холста CANVAS_SIZE (как слайдеры и перетаскивание).
-    canvas_w, canvas_h = float(CANVAS_SIZE[0]), float(CANVAS_SIZE[1])
-    dx_screen = state.offset_x * viewport_w / canvas_w
-    dy_screen = state.offset_y * viewport_h / canvas_h
-    # Keep panning strictly in screen/canvas axes:
-    # X/Y sliders and drag should always move image horizontally/vertically
-    # regardless of rotation angle.
-    cx = base_cx - dx_screen
-    cy = base_cy - dy_screen
-
-    # Для поворота берём из источника увеличенную область (bounding box),
-    # чтобы после rotate() центр кадра остался заполненным пикселями фото.
-    rot_bbox_w = cos_t * viewport_w + sin_t * viewport_h
-    rot_bbox_h = sin_t * viewport_w + cos_t * viewport_h
-    min_cx = rot_bbox_w / 2.0
-    max_cx = float(source.width) - rot_bbox_w / 2.0
-    min_cy = rot_bbox_h / 2.0
-    max_cy = float(source.height) - rot_bbox_h / 2.0
-    if min_cx > max_cx:
-        cx = float(source.width) / 2.0
-    else:
-        cx = max(min_cx, min(max_cx, cx))
-    if min_cy > max_cy:
-        cy = float(source.height) / 2.0
-    else:
-        cy = max(min_cy, min(max_cy, cy))
-
-    if rotation:
-        rot_factor_x = (cos_t * float(size[0]) + sin_t * float(size[1])) / max(1.0, float(size[0]))
-        rot_factor_y = (sin_t * float(size[0]) + cos_t * float(size[1])) / max(1.0, float(size[1]))
-        sample_size = (
-            max(size[0], int(math.ceil(size[0] * rot_factor_x))),
-            max(size[1], int(math.ceil(size[1] * rot_factor_y))),
-        )
-    else:
-        sample_size = size
-
-    sample_left = cx - (sample_size[0] * scale_src_x) / 2.0
-    sample_top = cy - (sample_size[1] * scale_src_y) / 2.0
-    frame = source.transform(
-        sample_size,
-        Image.Transform.AFFINE,
-        (scale_src_x, 0.0, sample_left, 0.0, scale_src_y, sample_top),
-        resample=Image.Resampling.BICUBIC,
-    )
-
-    if rotation:
-        frame = frame.rotate(rotation, resample=Image.Resampling.BICUBIC, expand=False)
-        crop_left = max(0, (sample_size[0] - size[0]) // 2)
-        crop_top = max(0, (sample_size[1] - size[1]) // 2)
-        frame = frame.crop((crop_left, crop_top, crop_left + size[0], crop_top + size[1]))
-
-    return frame
+    return _render_frame_with_plan(state, source, box, plan, size)
 
 
 def _channel_mult(img: Image.Image, r_mult: float, g_mult: float, b_mult: float) -> Image.Image:
@@ -1203,6 +1482,7 @@ class AutoRawGui(tk.Tk):
         self._menu_popups: list[tk.Toplevel] = []
         self.thumb_btns: list[tk.Label] = []
         self.thumb_cards: list[tk.Frame] = []
+        self.thumb_badges: list[tk.Label] = []
         self._thumb_drag: dict[str, int | bool] | None = None
         self._thumb_drop_index: int | None = None
         self._thumb_reorder_busy = False
@@ -1343,6 +1623,8 @@ class AutoRawGui(tk.Tk):
         self.set_progress(self.progress_var.get(), f"Режим загрузки: {label}")
         if self.selected_folder and self.selected_folder in self.folder_states:
             self.select_folder(self.selected_folder)
+        for folder in self.folder_states:
+            self._refresh_folder_checkpoint_badge(folder)
 
     def _set_window_icon(self, window: tk.Tk | tk.Toplevel | None = None) -> None:
         """Apply app icon to root or any child dialog."""
@@ -2227,6 +2509,7 @@ class AutoRawGui(tk.Tk):
             dict(label="Включить инструменты", children=enable_tools_items),
             dict(separator=True),
             dict(label="Цветокор…", command=self.show_colorcor_window),
+            dict(label="Сбросить все checkpoint", command=self._reset_all_checkpoints),
             dict(separator=True),
             dict(label="АвтоЭкшен…", command=self.launch_autoaction),
             dict(label="Парсер MAX…", command=self.show_outmax_settings),
@@ -2474,7 +2757,15 @@ class AutoRawGui(tk.Tk):
         row2 = tk.Frame(ctrl_wrap, bg=FIG_PANEL)
         row2.pack(fill=tk.X, pady=(6, 0))
         self.zoom     = self._slider(row2, "Масштаб",  0.5,  ZOOM_MAX, self.update_current, "{:.2f}")
-        self.rotation = self._slider(row2, "Поворот", -20,   20,      self.update_current, "{:.1f}°")
+        self.rotation = self._slider(
+            row2,
+            "Поворот",
+            -20,
+            20,
+            self.update_current,
+            "{:.1f}°",
+            resolution=0.1,
+        )
         self.zoom.set(1.0)
 
         rb = tk.Frame(ctrl_wrap, bg=FIG_PANEL)
@@ -2959,6 +3250,7 @@ class AutoRawGui(tk.Tk):
         exported: int,
         active_elapsed: float,
         droplet_processed: int,
+        stage_timings: dict[str, float] | None = None,
     ) -> None:
         detail_lines = [
             f"Экспортировано файлов: {exported}",
@@ -2966,6 +3258,8 @@ class AutoRawGui(tk.Tk):
         ]
         if droplet_processed:
             detail_lines.append(f"Через дроплеты: {droplet_processed}")
+        if stage_timings:
+            detail_lines.extend(_format_stage_timings(stage_timings))
         self._show_banner_toast(
             banner_file="MSG_Good.png",
             title="Кадрирование завершено",
@@ -3008,6 +3302,7 @@ class AutoRawGui(tk.Tk):
         stacked: bool = False,
         existing_var: tk.Variable | None = None,
         editable: bool = False,
+        resolution: float | None = None,
     ) -> tk.DoubleVar:
         """Canvas slider — thin track, accent fill, round thumb.
         compact=True → smaller (used for colour-correction row).
@@ -3096,7 +3391,7 @@ class AutoRawGui(tk.Tk):
                       highlightthickness=0, bd=0, cursor="hand2")
         c.pack(fill=tk.X, pady=(1, 3 if compact else 4))
 
-        resolution = 0.01 if abs(end - start) <= 10 else 1.0
+        resolution = resolution if resolution is not None else (0.01 if abs(end - start) <= 10 else 1.0)
 
         def _redraw(*_: object) -> None:
             w = c.winfo_width()
@@ -3547,6 +3842,88 @@ class AutoRawGui(tk.Tk):
             widget = widget.master  # type: ignore[assignment]
         self.select_folder(folder)
 
+    def _show_folder_context_menu(self, folder: Path, event: tk.Event) -> str:
+        self.select_folder(folder)
+        menu = tk.Menu(self, tearoff=0, bg=FIG_PANEL, fg=FIG_TEXT, activebackground=FIG_PANEL_L)
+        has_checkpoint = _has_export_checkpoint(folder)
+        menu.add_command(
+            label="Сбросить checkpoint" if has_checkpoint else "Checkpoint не найден",
+            state=tk.NORMAL if has_checkpoint else tk.DISABLED,
+            command=lambda f=folder: self._reset_folder_checkpoint(f),
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def _clear_folder_checkpoint_file(self, folder: Path) -> bool:
+        output_dir = folder / folder.name
+        state_path = _export_state_path(output_dir)
+        if not state_path.is_file():
+            return False
+        state_path.unlink()
+        return True
+
+    def _reset_folder_checkpoint(self, folder: Path) -> None:
+        try:
+            removed = self._clear_folder_checkpoint_file(folder)
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"Не удалось удалить checkpoint:\n{exc}")
+            return
+        self._refresh_folder_checkpoint_badge(folder)
+        if removed:
+            self.set_progress(self.progress_var.get(), f"Checkpoint сброшен: {folder.name}")
+        else:
+            self.set_progress(self.progress_var.get(), f"Checkpoint не найден: {folder.name}")
+
+    def _reset_all_checkpoints(self) -> None:
+        if self._export_running:
+            messagebox.showwarning(APP_NAME, "Нельзя сбросить checkpoint во время экспорта.")
+            return
+        if not self.folder_states:
+            messagebox.showinfo(APP_NAME, "Нет папок для сброса checkpoint.")
+            return
+        folders = [folder for folder in self.folder_states if _has_export_checkpoint(folder)]
+        if not folders:
+            messagebox.showinfo(APP_NAME, "В текущем корне нет checkpoint.")
+            return
+        root_name = self.root_folder.name if self.root_folder else "текущего корня"
+        confirmed = messagebox.askyesno(
+            APP_NAME,
+            f"Сбросить checkpoint у {len(folders)} папок в {root_name}?",
+        )
+        if not confirmed:
+            return
+        removed = 0
+        failed: list[str] = []
+        for folder in folders:
+            try:
+                if self._clear_folder_checkpoint_file(folder):
+                    removed += 1
+            except OSError:
+                failed.append(folder.name)
+            self._refresh_folder_checkpoint_badge(folder)
+        if failed:
+            messagebox.showwarning(
+                APP_NAME,
+                "Не удалось удалить checkpoint у папок:\n" + "\n".join(failed),
+            )
+        self.set_progress(self.progress_var.get(), f"Checkpoint сброшен у папок: {removed}")
+
+    def _refresh_folder_checkpoint_badge(self, folder: Path) -> None:
+        row = self._folder_row_widgets.get(folder.resolve())
+        if not row:
+            return
+        if self._export_running:
+            return
+        if self._export_mode_choice == "new" and _has_export_checkpoint(folder):
+            row["status_var"].set("resume")
+            row["status_lbl"].configure(fg=FIG_ACCENT)
+        else:
+            row["status_var"].set("")
+            row["status_lbl"].configure(fg=FIG_TEXT2)
+
     def _create_folder_row(self, folder: Path, state: FolderState) -> None:
         key = folder.resolve()
         bg = FIG_SEL if self.selected_folder and self.selected_folder.resolve() == key else FIG_BG
@@ -3614,6 +3991,10 @@ class AutoRawGui(tk.Tk):
                 "<Button-1>",
                 lambda e, f=key: self._on_folder_row_click(f, e),
             )
+            target.bind(
+                "<Button-3>",
+                lambda e, f=key: self._show_folder_context_menu(f, e),
+            )
 
         self._folder_row_widgets[key] = {
             "row": row_frame,
@@ -3626,6 +4007,7 @@ class AutoRawGui(tk.Tk):
             "status_var": status_var,
             "status_lbl": status_lbl,
         }
+        self._refresh_folder_checkpoint_badge(folder)
 
     def render_folder_tree(self) -> None:
         for widget in self._folder_list_inner.winfo_children():
@@ -3729,7 +4111,11 @@ class AutoRawGui(tk.Tk):
         self.render_thumbnails()
         self.select_frame(0, save_previous=False)
         mode_label = LOAD_MODE_LABELS.get(self._load_mode_choice, self._load_mode_choice)
-        self.set_progress(100, f"Загружено кадров: {len(frames)} за {elapsed:.1f} сек ({mode_label})")
+        missing = missing_frame_numbers(state.frame for state in frames)
+        progress = f"Загружено кадров: {len(frames)} за {elapsed:.1f} сек ({mode_label})"
+        if missing:
+            progress += f" · нет кадров: {_format_missing_frames(missing)}"
+        self.set_progress(100, progress)
         if lazy_crop:
             threading.Thread(target=self._crop_frames_worker, args=(token, folder), daemon=True).start()
         if self.pending_folder and self.pending_folder != folder:
@@ -3774,6 +4160,7 @@ class AutoRawGui(tk.Tk):
             child.destroy()
         self.thumb_photos = []
         self.thumb_cards = []
+        self.thumb_badges = []
         self._thumb_drag = None
         self._thumb_drop_index = None
         self._thumb_swap_from = None
@@ -3795,6 +4182,102 @@ class AutoRawGui(tk.Tk):
                 btn.configure(highlightbackground=FIG_ACCENT, highlightthickness=2, bd=0)
             else:
                 btn.configure(highlightbackground=FIG_BORDER, highlightthickness=1, bd=0)
+        for i, badge in enumerate(getattr(self, "thumb_badges", [])):
+            if not badge.winfo_exists():
+                continue
+            badge.configure(bg=FIG_ACCENT if i == self.selected_index else FIG_BTN)
+
+    def _frame_picker_items(self, index: int) -> list[dict[str, object]]:
+        frames = self.current_frames()
+        if not (0 <= index < len(frames)):
+            return []
+        current = frames[index]
+        items: list[dict[str, object]] = []
+        for frame_num in ALL_FRAME_NUMBERS:
+            occupant_index: int | None = None
+            for i, state in enumerate(frames):
+                if state.frame == frame_num:
+                    occupant_index = i
+                    break
+            if frame_num == current.frame:
+                label = f"  {int(frame_num)}   текущий"
+            elif occupant_index is not None:
+                name = frames[occupant_index].path.name
+                if len(name) > 14:
+                    name = name[:11] + "…"
+                label = f"  {int(frame_num)}   {name}"
+            else:
+                label = f"  {int(frame_num)}   —"
+            items.append({
+                "label": label,
+                "command": lambda frame=frame_num, idx=index: self._assign_frame_manually(idx, frame),
+            })
+        return items
+
+    def _show_frame_picker(self, index: int, anchor: tk.Widget) -> str:
+        items = self._frame_picker_items(index)
+        if not items:
+            return "break"
+        self._show_custom_menu(anchor, items)
+        return "break"
+
+    def _assign_frame_manually(self, index: int, new_frame: str) -> None:
+        frames = self.current_frames()
+        if not (0 <= index < len(frames)):
+            return
+        if frames[index].frame == new_frame:
+            return
+
+        self._save_controls_to_current()
+        aspect = target_aspect(REFERENCE_DIR)
+        other_index = assign_frame_to_index(frames, index, new_frame, aspect)
+        if other_index is None and frames[index].frame != new_frame:
+            return
+
+        affected = {index}
+        if other_index is not None:
+            affected.add(other_index)
+
+        for i in affected:
+            self._refresh_thumb_card(i, refresh_image=True)
+
+        if self.selected_index in affected:
+            self.select_frame(self.selected_index, save_previous=False)
+        else:
+            self._highlight_selected_thumb()
+
+        missing = missing_frame_numbers(state.frame for state in frames)
+        folder_name = self.selected_folder.name if self.selected_folder else ""
+        suffix = f" ({folder_name})" if folder_name else ""
+        old_text = self.progress_label.get()
+        base = old_text.split(" · нет кадров:")[0].split(" · ")[0]
+        progress = f"{base}{suffix}: кадр {int(new_frame):02d}"
+        if missing:
+            progress += f" · нет кадров: {_format_missing_frames(missing)}"
+        self.set_progress(self.progress_var.get(), progress)
+
+    def _make_frame_badge(self, parent: tk.Widget, index: int, state: FrameState) -> tk.Label:
+        is_selected = index == self.selected_index
+        badge = tk.Label(
+            parent,
+            text=frame_badge_text(state),
+            bg=FIG_ACCENT if is_selected else FIG_BTN,
+            fg="#ffffff",
+            font=("Segoe UI", 8, "bold"),
+            padx=4,
+            pady=1,
+            cursor="hand2",
+        )
+        badge._autoraw_frame_badge = True  # type: ignore[attr-defined]
+        badge.bind("<Button-1>", lambda _e, i=index, b=badge: self._show_frame_picker(i, b))
+        badge.bind("<Enter>", lambda _e, b=badge: b.configure(bg=FIG_ACCENT))
+        badge.bind(
+            "<Leave>",
+            lambda _e, b=badge, i=index: b.configure(
+                bg=FIG_ACCENT if i == self.selected_index else FIG_BTN
+            ),
+        )
+        return badge
 
     _THUMB_DRAG_THRESHOLD = 10
 
@@ -3837,6 +4320,11 @@ class AutoRawGui(tk.Tk):
     def _thumb_drag_press(self, event: tk.Event, index: int) -> None:
         if self._thumb_reorder_busy:
             return
+        widget = event.widget
+        while widget is not None:
+            if getattr(widget, "_autoraw_frame_badge", False):
+                return
+            widget = widget.master  # type: ignore[assignment]
         self._thumb_drag = {
             "index": index,
             "start_x": event.x_root,
@@ -3859,8 +4347,13 @@ class AutoRawGui(tk.Tk):
         drop_index = self._thumb_index_at_root(event.x_root, event.y_root)
         self._set_thumb_drop_highlight(drop_index, from_index=from_index)
         if drop_index is not None and drop_index != from_index:
-            slot_a = position_frame_number(from_index)
-            slot_b = position_frame_number(drop_index)
+            frames = self.current_frames()
+            if frames and 0 <= from_index < len(frames) and 0 <= drop_index < len(frames):
+                slot_a = frames[from_index].frame
+                slot_b = frames[drop_index].frame
+            else:
+                slot_a = f"{from_index + 1:02d}"
+                slot_b = f"{drop_index + 1:02d}"
             self.progress_label.set(f"↔ Поменять {slot_a} и {slot_b} местами")
 
     def _thumb_drag_release(self, event: tk.Event) -> None:
@@ -3915,12 +4408,8 @@ class AutoRawGui(tk.Tk):
             if badge_children:
                 frame_lbl = badge_children[0]
                 if isinstance(frame_lbl, tk.Label):
-                    score_text = ""
-                    if state.match_score is not None:
-                        confidence = max(0, min(99, int(round((1.0 - state.match_score) * 100))))
-                        score_text = f" · {confidence}%"
                     frame_lbl.configure(
-                        text=f"  {state.frame}{score_text}",
+                        text=frame_badge_text(state),
                         bg=FIG_ACCENT if index == self.selected_index else FIG_BTN,
                     )
 
@@ -3963,8 +4452,6 @@ class AutoRawGui(tk.Tk):
             if not frames:
                 self.worker_events.put(("swap_done", token, folder, from_index, to_index, False))
                 return
-            aspect = target_aspect(REFERENCE_DIR)
-            apply_frame_numbers_at_indices(frames, aspect, (from_index, to_index))
             self.worker_events.put(("swap_done", token, folder, from_index, to_index, True))
         except Exception as exc:
             self.worker_events.put(("swap_error", token, str(exc)))
@@ -3981,8 +4468,13 @@ class AutoRawGui(tk.Tk):
         if token != self._thumb_reorder_token:
             return
         self._stop_thumb_reorder_progress()
-        slot_a = position_frame_number(from_index)
-        slot_b = position_frame_number(to_index)
+        frames = self.folder_states[folder].frames if folder and folder in self.folder_states else []
+        if frames and 0 <= from_index < len(frames) and 0 <= to_index < len(frames):
+            slot_a = frames[from_index].frame
+            slot_b = frames[to_index].frame
+        else:
+            slot_a = f"{from_index + 1:02d}"
+            slot_b = f"{to_index + 1:02d}"
         folder_name = folder.name if folder else ""
         suffix = f" ({folder_name})" if folder_name else ""
 
@@ -4011,12 +4503,10 @@ class AutoRawGui(tk.Tk):
             return
 
         self._save_controls_to_current()
-        slot_a = position_frame_number(from_index)
-        slot_b = position_frame_number(to_index)
+        slot_a = frames[from_index].frame
+        slot_b = frames[to_index].frame
 
         frames[from_index], frames[to_index] = frames[to_index], frames[from_index]
-        frames[from_index].frame = slot_a
-        frames[to_index].frame = slot_b
 
         if self.selected_folder:
             self.folder_states[self.selected_folder].frames = frames
@@ -4072,6 +4562,7 @@ class AutoRawGui(tk.Tk):
         self.thumb_photos = []
         self.thumb_btns = []
         self.thumb_cards = []
+        self.thumb_badges = []
 
         self.thumbs.grid_columnconfigure(0, weight=1, uniform="thumb")
         self.thumbs.grid_columnconfigure(1, weight=1, uniform="thumb")
@@ -4088,13 +4579,9 @@ class AutoRawGui(tk.Tk):
 
             badge_row = tk.Frame(card, bg=FIG_SURFACE)
             badge_row.pack(fill=tk.X, pady=(0, 2))
-            score_text = ""
-            if state.match_score is not None:
-                confidence = max(0, min(99, int(round((1.0 - state.match_score) * 100))))
-                score_text = f" · {confidence}%"
-            tk.Label(badge_row, text=f"  {state.frame}{score_text}", bg=FIG_ACCENT if is_selected else FIG_BTN,
-                     fg="#ffffff", font=("Segoe UI", 8, "bold"),
-                     padx=4, pady=1).pack(side=tk.LEFT)
+            frame_badge = self._make_frame_badge(badge_row, index, state)
+            frame_badge.pack(side=tk.LEFT)
+            self.thumb_badges.append(frame_badge)
             chk = self._make_check(
                 badge_row,
                 state.checked,
@@ -4225,9 +4712,13 @@ class AutoRawGui(tk.Tk):
         if state.match_score is not None:
             confidence = max(0, min(99, int(round((1.0 - state.match_score) * 100))))
             match_text = f" · авто {confidence}%"
+        missing = missing_frame_numbers(item.frame for item in frames)
+        missing_text = ""
+        if missing:
+            missing_text = f"\n⚠  Нет кадров: {_format_missing_frames(missing)}"
         self.info_var.set(
             f"📁  {folder_text}\n"
-            f"🖼  {state.frame}{match_text} — {state.path.name}\n"
+            f"🖼  {state.frame}{match_text} — {state.path.name}{missing_text}\n"
             f"⌨  Стрелки / колесо · Пробел+ЛКМ — сдвиг зоны · Ctrl+колесо — {int(self.preview_workspace_scale * 100)}%"
         )
         self.preview.focus_set()
@@ -5518,6 +6009,22 @@ AutoRAW Compressor — инструмент пакетной обработки 
 Галочка на миниатюре включает / исключает кадр из экспорта.
 Стрелки клавиатуры переключают между кадрами.
 
+### Номер кадра (01–08)
+
+При загрузке папки программа сопоставляет каждое фото с эталонами
+`reference/Sneakers/search/1.jpg … 8.jpg` и назначает номер **по ракурсу**.
+На бейдже миниатюры показывается номер и уверенность, например `03 · 78%`.
+
+- Если в папке меньше 8 снимков, пропуски сохраняются (в статусе: `нет кадров: 3, 7`).
+- Экспорт сохраняет файлы как `1.jpg`, `4.jpg`, … — без схлопывания номеров.
+
+**Ручной выбор номера:** нажмите на бейдж миниатюры → выберите `01`…`08`.
+Правило кадрирования, превью и эталон обновятся под выбранный номер.
+Если номер уже занят другим фото — номера поменяются местами.
+В меню: `—` — слот свободен; имя файла — кто занимает этот номер.
+
+Перетаскивание миниатюр меняет порядок в списке; номера кадров при этом не пересчитываются.
+
 ## 3. Настройка кадра
 
 **Мышь на холсте превью:**
@@ -6213,12 +6720,27 @@ AutoRAW Compressor — инструмент пакетной обработки 
         self._begin_folder_export_ui(checked_folders)
         n_folders = len(checked_folders)
         root_hint = self.root_folder.name if self.root_folder else ""
-        self.set_progress(0, f"{n_folders} папок · {root_hint}" if root_hint else "Готовлю экспорт...")
+        resumed_count = 0
+        if export_mode == "new":
+            resumed_count = sum(1 for folder in checked_folders if _has_export_checkpoint(folder))
+        if resumed_count:
+            resume_note = f" · resume: {resumed_count}"
+        else:
+            resume_note = ""
+        self.set_progress(
+            0,
+            (
+                f"{n_folders} папок · {root_hint}{resume_note}"
+                if root_hint
+                else f"Готовлю экспорт...{resume_note}"
+            ),
+        )
         mode_label = EXPORT_MODE_LABELS.get(export_mode, export_mode)
         self._send_zona(
             f"🚀 <b>Экспорт запущен</b>\n"
             f"Папок: {n_folders}\n"
             f"Режим: {mode_label}"
+            + (f"\nResume-папок: {resumed_count}" if resumed_count else "")
         )
         threading.Thread(
             target=self.export_worker,
@@ -6245,6 +6767,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
         raw_droplet = DROPLETS_DIR / RAW_DROPLET_NAME
         raw_droplet_warned = False
         intermediate_pngs: list[Path] = []
+        stage_timings: dict[str, float] = {"raw": 0.0, "crop": 0.0, "droplet": 0.0}
         total_units = 0
         folder_units: dict[Path, int] = {}
 
@@ -6252,6 +6775,19 @@ AutoRAW Compressor — инструмент пакетной обработки 
             folder_state = self.folder_states.get(folder)
             if not folder_state:
                 return 1
+            output_dir = folder / folder.name
+            export_state = _load_export_state(output_dir) if new_export and output_dir.exists() else {}
+            raw_outputs_state = _state_raw_outputs(export_state) if export_state else {}
+            exported_outputs = (
+                {name for name in _state_files(export_state, "exported_outputs") if (output_dir / name).is_file()}
+                if export_state
+                else set()
+            )
+            droplet_outputs = (
+                {name for name in _state_files(export_state, "droplet_outputs") if (output_dir / name).is_file()}
+                if export_state
+                else set()
+            )
             if folder_state.frames is None:
                 source_paths = direct_image_files(folder)[:8]
                 units = len(source_paths) * 2
@@ -6262,18 +6798,34 @@ AutoRAW Compressor — инструмент пакетной обработки 
             if not checked_frames:
                 return 1
             if new_export:
-                nef_count = len(
-                    {
-                        nef
-                        for frame in checked_frames
-                        if (nef := nef_source_path(frame)) is not None
-                    }
+                nef_paths = {
+                    nef
+                    for frame in checked_frames
+                    if (nef := nef_source_path(frame)) is not None
+                }
+                pending_nef_count = 0
+                for nef in nef_paths:
+                    cached_png = raw_outputs_state.get(_nef_state_key(nef))
+                    if not cached_png or not Path(cached_png).is_file():
+                        pending_nef_count += 1
+                pending_frame_count = sum(
+                    1
+                    for frame in checked_frames
+                    if export_name_for_frame(frame) not in exported_outputs
                 )
-                units = nef_count + len(checked_frames)
+                units = pending_nef_count + pending_frame_count
             else:
                 units = len(checked_frames)
             if use_droplets:
-                units += len([frame for frame in checked_frames if frame.frame in DROPLET_BY_FRAME])
+                pending_droplets = 0
+                for frame in checked_frames:
+                    if frame.frame not in DROPLET_BY_FRAME:
+                        continue
+                    export_name = export_name_for_frame(frame)
+                    if new_export and export_name in droplet_outputs and (output_dir / export_name).is_file():
+                        continue
+                    pending_droplets += 1
+                units += pending_droplets
             return max(1, units)
 
         for folder in checked_folders:
@@ -6299,6 +6851,9 @@ AutoRAW Compressor — инструмент пакетной обработки 
         def run_folder_droplets(
             folder_exports: list[tuple[Path, str]],
             folder_name: str,
+            *,
+            done_outputs: set[str] | None = None,
+            mark_done: Callable[[str], None] | None = None,
             on_unit_done: Callable[[str], None] | None = None,
         ) -> None:
             nonlocal droplet_processed, done_units
@@ -6323,9 +6878,13 @@ AutoRAW Compressor — инструмент пакетной обработки 
                 for output_path in paths:
                     if stop_now():
                         return
+                    output_name = output_path.name
+                    if done_outputs is not None and output_name in done_outputs and output_path.is_file():
+                        continue
                     report_progress(f"Дроплет {droplet_name}: {folder_name}\\{output_path.name}")
                     try:
                         before_stat = output_path.stat()
+                        stage_started = time.monotonic()
                         result = run_droplet_subprocess([str(droplet_exe), str(output_path)])
                         if result.returncode == -1 and result.stderr == "timeout":
                             self.worker_events.put(
@@ -6336,6 +6895,9 @@ AutoRAW Compressor — инструмент пакетной обработки 
                                 )
                             )
                         wait_for_output_stable(output_path, before_stat)
+                        elapsed = time.monotonic() - stage_started
+                        stage_timings["droplet"] += elapsed
+                        folder_stage_timings["droplet"] += elapsed
                         stderr_text = (result.stderr or "").strip()
                         stdout_text = (result.stdout or "").strip()
 
@@ -6372,6 +6934,10 @@ AutoRAW Compressor — инструмент пакетной обработки 
                             ("warning", token, f"Не удалось запустить дроплет {droplet_name}:\n{exc}")
                         )
                     droplet_processed += 1
+                    if done_outputs is not None:
+                        done_outputs.add(output_name)
+                    if mark_done is not None:
+                        mark_done(output_name)
                     done_units += 1
                     if on_unit_done:
                         on_unit_done(f"Дроплет {droplet_name}")
@@ -6386,7 +6952,11 @@ AutoRAW Compressor — инструмент пакетной обработки 
             folder = nef_path.parent
             before = _snapshot_pngs(folder)
             try:
+                stage_started = time.monotonic()
                 result = run_droplet_subprocess([str(raw_droplet), str(nef_path)])
+                elapsed = time.monotonic() - stage_started
+                stage_timings["raw"] += elapsed
+                folder_stage_timings["raw"] += elapsed
             except Exception as exc:
                 warn(f"Не удалось запустить {RAW_DROPLET_NAME} для {nef_path.name}:\n{exc}")
                 return None
@@ -6412,6 +6982,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
             folder_key = folder.resolve()
             folder_total = folder_units.get(folder_key, 1)
             folder_done = 0
+            folder_stage_timings: dict[str, float] = {"raw": 0.0, "crop": 0.0, "droplet": 0.0}
 
             def advance_folder(label: str) -> None:
                 nonlocal folder_done
@@ -6461,6 +7032,19 @@ AutoRAW Compressor — инструмент пакетной обработки 
             output_dir.mkdir(parents=True, exist_ok=True)
             folder_exported = 0
             folder_droplet_exports: list[tuple[Path, str]] = []
+            export_state = _load_export_state(output_dir)
+            raw_outputs_state = _state_raw_outputs(export_state)
+            exported_outputs = {
+                name for name in _state_files(export_state, "exported_outputs") if (output_dir / name).is_file()
+            }
+            droplet_outputs = {
+                name for name in _state_files(export_state, "droplet_outputs") if (output_dir / name).is_file()
+            }
+
+            def persist_export_state() -> None:
+                _state_set_files(export_state, "exported_outputs", exported_outputs)
+                _state_set_files(export_state, "droplet_outputs", droplet_outputs)
+                _save_export_state(output_dir, export_state)
 
             acr_outputs: dict[Path, Path] = {}
             if new_export:
@@ -6479,15 +7063,30 @@ AutoRAW Compressor — инструмент пакетной обработки 
                         break
                     raw_done += 1
                     report_progress(f"RAW: {raw_done}/{raw_total} — {folder.name}\\{nef_path.name}")
-                    png_path = run_raw_droplet(nef_path)
+                    nef_key = _nef_state_key(nef_path)
+                    png_path: Path | None = None
+                    created_raw = False
+                    cached_png = raw_outputs_state.get(nef_key)
+                    if cached_png:
+                        cached_path = Path(cached_png)
+                        if cached_path.is_file():
+                            png_path = cached_path
+                    if png_path is None:
+                        png_path = run_raw_droplet(nef_path)
+                        if png_path is not None:
+                            created_raw = True
+                            raw_outputs_state[nef_key] = str(png_path)
+                            persist_export_state()
                     done_units += 1
                     advance_folder(nef_path.name)
                     if png_path is not None:
                         acr_outputs[nef_path] = png_path
-                        intermediate_pngs.append(png_path)
+                        if created_raw and png_path not in intermediate_pngs:
+                            intermediate_pngs.append(png_path)
 
                 crop_total = len(checked_frames)
                 crop_done = 0
+                png_size_cache: dict[Path, tuple[int, int]] = {}
                 for frame in checked_frames:
                     if stop_now():
                         break
@@ -6496,12 +7095,21 @@ AutoRAW Compressor — инструмент пакетной обработки 
                     png_path = acr_outputs.get(nef_path) if nef_path else None
                     export_name = export_name_for_frame(frame)
                     report_progress(f"Кадрирование: {crop_done}/{crop_total} — {export_name}")
+                    output_path = output_dir / export_name
+                    if export_name in exported_outputs and output_path.is_file():
+                        folder_droplet_exports.append((output_path, frame.frame))
+                        folder_exported += 1
+                        continue
                     if png_path is None or not png_path.is_file():
                         done_units += 1
                         advance_folder(export_name)
                         continue
                     try:
-                        full_image = _load_export_source_image(png_path)
+                        full_size = png_size_cache.get(png_path)
+                        if full_size is None:
+                            with Image.open(png_path) as full_image_info:
+                                full_size = ImageOps.exif_transpose(full_image_info).size
+                            png_size_cache[png_path] = full_size
                     except Exception as exc:
                         warn(f"Не удалось открыть {png_path.name}:\n{exc}")
                         done_units += 1
@@ -6510,16 +7118,17 @@ AutoRAW Compressor — инструмент пакетной обработки 
                     scaled_crop = scale_crop_box(
                         frame.crop_box,
                         frame.image.size,
-                        full_image.size,
+                        full_size,
                     )
-                    output = render_frame(
-                        frame,
-                        CANVAS_SIZE,
-                        source_image=full_image,
-                        crop_box=scaled_crop,
-                    )
-                    output_path = output_dir / export_name
+                    stage_started = time.monotonic()
+                    output = _render_frame_from_path(frame, png_path, scaled_crop, CANVAS_SIZE)
                     _save_export_jpeg(output, output_path)
+                    output.close()
+                    elapsed = time.monotonic() - stage_started
+                    stage_timings["crop"] += elapsed
+                    folder_stage_timings["crop"] += elapsed
+                    exported_outputs.add(export_name)
+                    persist_export_state()
                     folder_droplet_exports.append((output_path, frame.frame))
                     exported += 1
                     folder_exported += 1
@@ -6550,11 +7159,19 @@ AutoRAW Compressor — инструмент пакетной обработки 
                 run_folder_droplets(
                     folder_droplet_exports,
                     folder.name,
+                    done_outputs=droplet_outputs,
+                    mark_done=lambda _name: persist_export_state(),
                     on_unit_done=advance_folder,
                 )
+            if not stop_now() and new_export:
+                try:
+                    self._clear_folder_checkpoint_file(folder)
+                except OSError:
+                    pass
             if not stop_now():
+                folder_summary = _format_stage_timings_short(folder_stage_timings)
                 self.worker_events.put(
-                    ("folder_export", token, folder_key, "done", 100, "Готово")
+                    ("folder_export", token, folder_key, "done", 100, folder_summary or "Готово")
                 )
             if stop_now():
                 break
@@ -6575,7 +7192,17 @@ AutoRAW Compressor — инструмент пакетной обработки 
         active_elapsed = job.active_elapsed()
         cancelled = job.cancelled
         self.worker_events.put(
-            ("export_done", token, exported, droplet_processed, active_elapsed, cancelled, use_autoaction, exported_dirs)
+            (
+                "export_done",
+                token,
+                exported,
+                droplet_processed,
+                active_elapsed,
+                cancelled,
+                use_autoaction,
+                exported_dirs,
+                stage_timings,
+            )
         )
 
     def set_progress(self, value: float, text: str) -> None:
@@ -6619,7 +7246,7 @@ AutoRAW Compressor — инструмент пакетной обработки 
             row["status_lbl"].configure(fg=FIG_TEXT)
         elif status == "done":
             row["var"].set(100)
-            row["status_var"].set("Готово")
+            row["status_var"].set(text or "Готово")
             row["bar"].configure(style="ExportDone.Horizontal.TProgressbar")
             row["status_lbl"].configure(fg=FIG_SUCCESS)
 
@@ -6671,10 +7298,11 @@ AutoRAW Compressor — инструмент пакетной обработки 
                     text=text,
                 )
             elif kind == "export_done":
-                _, token, exported, droplet_processed, active_elapsed, cancelled, use_autoaction, exported_dirs = event
+                _, token, exported, droplet_processed, active_elapsed, cancelled, use_autoaction, exported_dirs, stage_timings = event
                 if token != getattr(self, "_export_token", token):
                     continue
                 self._set_export_controls(False)
+                stage_lines = _format_stage_timings(stage_timings)
                 if cancelled:
                     info = f"Экспорт отменён: {exported} файлов, рабочее время {active_elapsed:.1f} сек"
                     msg = f"Экспорт отменён.\nФайлов успело сохраниться: {exported}\nРабочее время: {active_elapsed:.1f} сек (без пауз)"
@@ -6686,12 +7314,15 @@ AutoRAW Compressor — инструмент пакетной обработки 
                 if droplet_processed:
                     info += f" (дроплет: {droplet_processed})"
                     msg += f"\nЧерез дроплеты обработано: {droplet_processed}"
+                if stage_lines:
+                    msg += "\n\nПо этапам:\n" + "\n".join(stage_lines)
+                    info += " · этапы замерены"
                 self.set_progress(100 if not cancelled else self.progress_var.get(), info)
                 self.render_thumbnails()
                 if cancelled:
                     messagebox.showinfo(APP_NAME, msg)
                 else:
-                    self._show_export_success_toast(exported, active_elapsed, droplet_processed)
+                    self._show_export_success_toast(exported, active_elapsed, droplet_processed, stage_timings)
                     if use_autoaction and exported_dirs:
                         if self.launch_autoaction(exported_dirs):
                             info += " · АвтоЭкшен"
@@ -6700,9 +7331,13 @@ AutoRAW Compressor — инструмент пакетной обработки 
                 zona_text = f"{zona_title}\nФайлов: {exported}  |  Рабочее время: {active_elapsed:.1f} сек"
                 if droplet_processed:
                     zona_text += f"\nДроплет: {droplet_processed}"
+                if stage_lines:
+                    zona_text += "\n" + "\n".join(stage_lines)
                 if use_autoaction and exported_dirs and not cancelled:
                     zona_text += f"\nАвтоЭкшен: {len(exported_dirs)} папок"
                 self._send_zona(zona_text)
+                for folder in self.folder_states:
+                    self._refresh_folder_checkpoint_badge(folder)
             elif kind == "warning":
                 _, token, text = event
                 if token == self.load_token:
